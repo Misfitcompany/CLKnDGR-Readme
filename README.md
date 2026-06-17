@@ -1,4 +1,5 @@
-CLKnDGR: Subtle explanation and feedback request of the contract I am working on. - Misfitcompany K.I.R | D.O.M
+CLKnDGR-Readme
+Subtle explanation of the contract I am working on. - Misfitcompany K.I.R | D.O.M
 
 ### DISCLAIMER: Claude Coded
 
@@ -118,29 +119,38 @@ Both strategies transfer share management rights between the contract, QX, and Q
 ## Profit Distribution
 
 At the end of each epoch, trading profit is split across several destinations. The exact split
-is a governable parameter — shareholders can vote to change the active preset. The three presets
-balance aggressively between reinvestment (growing the trading pool), protocol sustainability
-(Qearn locking, burn, dev fund), and shareholder reward.
+is a governable parameter — shareholders can vote to change the active preset. The presets
+balance reinvestment (growing the trading pool and funding execution), ecosystem contribution
+(boosting Qearn and the Computor Controlled Fund), and shareholder reward.
+
+**A note on Qearn:** rather than locking its Qearn allocation to earn yield for itself, Cloak and
+Dagger **donates** that slice to the Qearn bonus pool — raising the locking rewards earned by the
+entire Qubic community. The contract keeps nothing back: it bolsters Qearn rather than profiting
+from it.
 
 | Destination | Role |
 |---|---|
 | **Trading pool** | Reinvested as vault capital — benefits depositors via NAV growth |
-| **Execution fees** | Covers on-chain execution costs |
-| **Qearn reserve** | Accumulates toward periodic Qearn locks (burns QU over time) |
+| **Execution fees** | Funds on-chain execution costs |
+| **Qearn boost** | Donated to the Qearn bonus pool — raises locking rewards for the whole Qubic community |
 | **Shareholders** | Direct epoch dividend to governance token holders |
-| **Burn** | Deflationary supply reduction |
+| **Burn** | Deflationary supply reduction (currently set to 0% in all presets) |
 | **Dev fund** | Protocol development reserve (shareholder-controlled withdrawal) |
 | **CCF** | Qubic Computor Controlled Fund contribution |
 
 ### The three presets
 
-| Preset | Trading pool | Exec fees | Qearn reserve | Shareholders | Burn | Dev fund | CCF |
+| Preset | Trading pool | Exec fees | Qearn boost | Shareholders | Burn | Dev fund | CCF |
 |---|---|---|---|---|---|---|---|
-| **0 — Default** | 50% | 15% | 3% | 10% | 10% | 6% | 6% |
-| **1 — Growth** | 55% | 10% | 7% | 9% | 9% | 4% | 6% |
-| **2 — Aggressive** | 60% | 12% | 9% | 7% | 7% | 1% | 4% |
+| **0 — Default** | 55% | 30% | 3% | 10% | 0% | 1% | 1% |
+| **1 — Growth** | 61% | 27% | 3% | 7% | 0% | 1% | 1% |
+| **2 — Aggressive** | 65% | 25% | 3% | 5% | 0% | 1% | 1% |
 
-Preset 0 balances all destinations evenly. Preset 1 and 2 progressively shift weight toward the trading pool and Qearn reserve at the expense of the dev fund and shareholder dividend. Shareholders vote to change the active preset.
+Preset 0 pays shareholders the most (10%) and funds execution moderately. Presets 1 and 2
+progressively steer more toward the trading pool and execution-fee funding, with a smaller
+shareholder dividend (7% → 5%). The Qearn boost (3%), dev fund (1%), and CCF (1%) are constant
+across all three, and trading profit is no longer burned (burns still occur via vault fees on
+withdrawal). Shareholders vote to change the active preset.
 
 ---
 
@@ -197,23 +207,13 @@ Two paths exist for anyone to contribute QU to the contract's capital base:
 
 - **Shareholder donation (`DonateToContract`):** Available to wallets holding at least one
   CLKnDGR share. Send exactly **6,900,420 QU** — split evenly between the trading pool and
-  the Qearn reserve. Overpayment is refunded; underpayment is rejected.
+  the Qearn boost. Overpayment is refunded; underpayment is rejected.
 - **Public donation (`PublicDonate`):** Open to any wallet. Send exactly **3,000,000 QU** —
-  80% goes to the Qearn reserve, 20% to the trading pool. Overpayment is refunded;
+  80% goes to the Qearn boost, 20% to the trading pool. Overpayment is refunded;
   underpayment is rejected.
 
 Donations credit the vault NAV at the next epoch boundary — they do not trigger an immediate
 share price update mid-epoch.
-
----
-
-## Qearn Integration
-
-The Qearn reserve accumulates QU over time. Once it crosses a threshold, the contract
-automatically locks that QU into Qubic's native Qearn protocol. Qearn locks generate a
-yield that returns to the contract at lock maturity — and QU that is not reclaimed by
-lock expiry is burned. This creates a secondary deflationary pressure alongside the
-explicit burn allocation in the profit split.
 
 ---
 
