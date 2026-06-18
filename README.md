@@ -5,18 +5,25 @@ Subtle explanation of the contract I am working on. - Misfitcompany K.I.R | D.O.
 
 # Cloak and Dagger (CLKnDGR)
 
-**An on-chain arbitrage liquidity protocol for Qubic — seeking community feedback on design.**
+**A proposed arbitrage liquidity protocol for Qubic — a design in development, shared for community feedback.**
+
+> **Note:** This describes a design in development. The CLKnDGR contract is not yet deployed — whether
+> it reaches the Qubic network is up to Computor Governance, which would need to approve it. The
+> protocols it builds on — Qearn, QX, and Qswap — are already live on-chain; it's CLKnDGR itself that's
+> still being built. The shareholder and depositor governance described below is the contract's own
+> internal governance, which would apply once it's running. Everything here describes how the contract
+> is intended to work.
 
 ---
 
 ## What is Cloak and Dagger?
 
-Cloak and Dagger is a smart contract on the Qubic network that runs automated arbitrage between
-QU and Qubic-native token markets. It pools capital from two groups — shareholders and vault
-depositors — and uses that capital to find and capture price discrepancies across pools, returning
-profit to participants at the end of each epoch.
+Cloak and Dagger is a proposed smart contract for the Qubic network, designed to run automated
+arbitrage between QU and Qubic-native token markets. It would pool capital from two groups —
+shareholders and vault depositors — and use that capital to find and capture price discrepancies
+across pools, returning profit to participants at the end of each epoch.
 
-The contract name is `CLKnDGR`. Shares are issued via Qubic's IPO mechanism.
+The contract name is `CLKnDGR`. Shares would be issued via Qubic's IPO mechanism, if it proceeds to one.
 
 ---
 
@@ -156,7 +163,7 @@ withdrawal). Shareholders vote to change the active preset.
 
 ## On-Chain Governance
 
-> **Important:** There is no front-end or web interface planned for Cloak and Dagger governance. All proposal submission, voting, and veto actions are performed directly via the `qubic-cli` command-line tool. A full ABI reference with exact command formats for every procedure is published alongside this document. Shareholders and depositors are expected to interact with the contract directly — no intermediary tool is required or endorsed.
+> **Important:** There is no front-end or web interface planned for Cloak and Dagger governance. As designed, all proposal submission, voting, and veto actions would be performed directly via the `qubic-cli` command-line tool. A full ABI reference with exact command formats for every procedure is provided alongside this document. Shareholders and depositors would interact with the contract directly — no intermediary tool is required or endorsed.
 
 Governance proposals are submitted by shareholders (requires holding ≥1 CLKnDGR share) and
 voted on by the shareholder group. A proposal passes when:
@@ -223,7 +230,7 @@ share price update mid-epoch.
 - The depositor veto is an independent check on shareholder power.
 - Early exit penalties protect depositors who honor the lock from value dilution by those who exit.
 - No admin keys. No owner overrides. Governance is the only upgrade path. (Dev Fund is for hard fixes)
-- The contract is open source and will be published to the Qubic core repository.
+- The contract is open source; the source would be published if it ever advances toward deployment.
 
 ---
 
@@ -243,8 +250,9 @@ community input on:
 
 ## Status
 
-- Contract: written, in unit testing
-- Deployment: pending IPO epoch scheduling
-- Source code: to be published alongside deployment announcement
+- Contract: written, in unit testing — a work in progress, not yet deployed.
+- Deployment: up to Computor Governance — reaching the network would require the Computors to approve
+  the contract, which hasn't happened and isn't a given.
+- Source code: would be published if the project advances toward deployment.
 
-*Questions and feedback welcome. This is a community protocol and we want to get the design right before launch.*
+*Questions and feedback welcome — this is a proposed protocol and we'd like to get the design right.*
