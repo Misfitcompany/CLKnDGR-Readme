@@ -208,19 +208,14 @@ The 5% burn and 5% execution cost are taken immediately at submission. The remai
 
 ---
 
-## Donation Mechanisms
+## Donations
 
-Two paths exist for anyone to contribute QU to the contract's capital base:
+Anyone can support the contract with a donation of exactly **3,000,000 QU**. **100% of a donation
+goes to the contract's execution-fee reserve** — the on-chain budget that lets the contract keep
+running every tick. Overpayment is refunded; underpayment is rejected.
 
-- **Shareholder donation (`DonateToContract`):** Available to wallets holding at least one
-  CLKnDGR share. Send exactly **6,900,420 QU** — split evenly between the trading pool and
-  the Qearn boost. Overpayment is refunded; underpayment is rejected.
-- **Public donation (`PublicDonate`):** Open to any wallet. Send exactly **3,000,000 QU** —
-  80% goes to the Qearn boost, 20% to the trading pool. Overpayment is refunded;
-  underpayment is rejected.
-
-Donations credit the vault NAV at the next epoch boundary — they do not trigger an immediate
-share price update mid-epoch.
+Donations don't buy vault shares, earn yield, or change the vault's value — they're simply a way
+for supporters to help keep the contract funded and operational.
 
 ---
 
@@ -242,7 +237,7 @@ community input on:
 1. **Profit split presets** — do the three options cover the range of preferences, or is something missing?
 2. **Vault mechanics** — is the 26-epoch lock + early exit penalty the right trade-off? Too long? Too short?
 3. **Depositor veto threshold** — 125 out of up to 5,000 depositors, with a minimum locked QU. Too easy to veto? Too hard?
-4. **Donation split** — does the 50/50 shareholder donation and 80/20 public donation feel right as incentive design?
+4. **Donations** — does routing 100% of a donation to the contract's execution-fee reserve (keeping it funded to run) feel right, or should donations do something else?
 5. **Pool governance fees** — ADD_POOL costs 200M QU. Is this an appropriate barrier to prevent spam pools?
 6. **Any other comment or concern**
 
