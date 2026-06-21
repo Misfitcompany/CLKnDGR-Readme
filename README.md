@@ -66,7 +66,7 @@ and a vault position.
 
 ## How Arbitrage Works
 
-The contract scans registered asset pools approximately **4 times per second** (once per network tick) for profitable price discrepancies between the asset's QU value on one side and market price on the other. When a discrepancy exceeds a configurable minimum profit threshold, the contract executes a trade using its available capital.
+The contract scans registered asset pools approximately **4 times per second** (once per network tick) for profitable price discrepancies between the asset's QU value on one side and market price on the other. When a discrepancy exceeds a configurable minimum **net** profit threshold (after trading fees), the contract executes a trade using its available capital.
 
 Pools are registered on-chain via the governance system (shareholder vote). Active pools
 participate in arbitrage; deactivated pools are skipped but their records are retained.
@@ -197,7 +197,7 @@ current NAV — a depositor who has lost significant value no longer qualifies.
 | 1 | **ADD_POOL** | 200M QU | Registers a new token/QU pool for arbitrage. Asset name and issuer required. Max 255 pools total. |
 | 2 | **REMOVE_POOL** | 50M QU | Deactivates an active pool. Arbitrage stops; pool record and any held reserves are retained. |
 | 3 | **REACTIVATE_POOL** | 50M QU | Re-enables a previously deactivated pool. |
-| 4 | **UPDATE_MIN_PROFIT** | 50M QU | Sets the minimum QU profit required before a Dagger trade executes. Also gates the Cloak's buy entries. |
+| 4 | **UPDATE_MIN_PROFIT** | 50M QU | Sets the minimum **net** QU profit per arb (after the Qswap swap fee) required before a Dagger trade executes. Also used as the Cloak's minimum capital to open a buy. Allowlist: 100,100 / 250,100 / 420,000 / 676,420. |
 | 5 | **WITHDRAW_QU_RESERVE** | 50M QU | Transfers QU from the on-chain dev fund reserve to a specified destination. Amount must not exceed the current reserve. |
 | 6 | **UPDATE_PROPOSAL_FEE** | 50M QU | Changes the default submission fee for all proposal types except ADD_POOL and UPDATE_PAYOUT. |
 | 7 | **UPDATE_PAYOUT** | 69M QU | Switches the active profit distribution preset (0, 1, 2, or 3 = recovery — see table above). |
