@@ -194,7 +194,7 @@ epoch end (so the reserve keeps only the 31%).
 ```cpp
 struct SubmitProposal_input
 {
-    uint8  proposalType;    // proposal type constant (1–22)
+    uint8  proposalType;    // proposal type constant (1–23)
     uint64 assetName;       // ADD_POOL only; 0 otherwise
     id     assetIssuer;     // ADD_POOL only; NULL_ID otherwise
     uint64 poolIndex;       // pool-indexed types only; 0 otherwise
@@ -341,12 +341,12 @@ Switch the epoch profit distribution preset.
 
 **Validation:** `newValue` must be 0, 1, 2, or 3.
 
-| newValue | Trading | Exec fees | Qearn | Shareholders | Burn | Dev fund | CCF |
-|---|---|---|---|---|---|---|---|
-| 0 (default) | 55% | 30% | 3% | 10% | 0% | 1% | 1% |
-| 1 | 61% | 27% | 3% | 7% | 0% | 1% | 1% |
-| 2 | 65% | 25% | 3% | 5% | 0% | 1% | 1% |
-| 3 (recovery) | 0% | 100% | 0% | 0% | 0% | 0% | 0% |
+| newValue | Trading | Exec fees | Qearn | Shareholders | Dev fund | CCF |
+|---|---|---|---|---|---|---|
+| 0 (default) | 55% | 30% | 3% | 10% | 1% | 1% |
+| 1 | 61% | 27% | 3% | 7% | 1% | 1% |
+| 2 | 65% | 25% | 3% | 5% | 1% | 1% |
+| 3 (recovery) | 0% | 100% | 0% | 0% | 0% | 0% |
 
 Preset 3 is the **recovery / limp-mode** split: 100% of profit refills the execution-fee reserve and all
 other payouts are suspended, while the contract keeps trading normally. It is **auto-applied** whenever
@@ -704,6 +704,34 @@ up empty.) Submitted in **seconds**; stored internally as ticks (× 4 ticks/sec)
 
 ---
 
+#### Type 23 — UPDATE_QX_FEE_MODE
+
+Sets how the contract sources QX's **share-transfer fee** for the sell leg of its trades (the fee paid when
+handing QX managing rights via `releaseShares`). QX's fee is a fixed **100 QU** today — set once at QX's
+init with no runtime setter — so the contract caches it per epoch and the sell legs read the cache,
+avoiding a QX `Fees` lookup on every trade.
+
+This proposal is **forward-looking insurance**: if QX ever changes its fee model so the fee can vary
+tick-to-tick, shareholders set this to **1** and the Cloak + Dagger sell legs fetch the fee **live** before
+each sell — **no contract re-deploy required**. Until then, leave it at **0**. A stale cache is harmless
+either way: if it were ever too low, the sell simply doesn't execute (no loss); too high, a few QU overpaid.
+
+**Fee:** 50,000,000 QU
+
+**Validation:** `newValue` must be 0 or 1.
+
+| newValue | QX fee source |
+|---|---|
+| 0 (default) | Per-epoch cached fee (cheapest) |
+| 1 | Live QX fetch before every sell |
+
+**Format string:**
+```
+"23uint8, 0uint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid, 0uint64, <newValue>sint64, 0sint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid"
+```
+
+---
+
 ### Consensus requirements
 
 For a proposal to pass at epoch end, **all four** conditions must be met:
@@ -745,6 +773,57 @@ Returns overall contract statistics. No input required.
 
 ---
 
+### GetPool (Function ID 2)
+
+Returns one pool's asset name, issuer, and active status by index (0 .. poolCount − 1).
+
+```
+./qubic-cli -nodeip NODE_IP -nodeport NODE_PORT \
+  -callcontractfunction CONTRACT_INDEX 2 "POOL_INDEXuint64" \
+  "uint64,id,uint8"
+```
+
+**Output fields in order:**
+
+| Field | Type | Description |
+|---|---|---|
+| `assetName` | uint64 | The pool token's asset name (ticker encoded as uint64) |
+| `assetIssuer` | id | The pool token's issuer address |
+| `active` | uint8 | 1 if actively traded; 0 if paused/inactive (also 0 if the index is out of range) |
+
+---
+
+### GetProposal (Function ID 3)
+
+Returns the full state of one governance proposal slot (0–9) for the current epoch, including depositor veto tallies.
+
+```
+./qubic-cli -nodeip NODE_IP -nodeport NODE_PORT \
+  -callcontractfunction CONTRACT_INDEX 3 "SLOT_NUMBERuint8" \
+  "uint8,uint8,id,uint64,id,uint64,sint64,sint64,id,sint64,sint64,sint64,uint16,uint16"
+```
+
+**Output fields in order:**
+
+| Field | Type | Description |
+|---|---|---|
+| `proposalType` | uint8 | Proposal type 1–23 (0 if the slot is empty) |
+| `status` | uint8 | 0 = empty, 1 = active (awaiting epoch-end tally), 2 = passed, 3 = failed |
+| `proposer` | id | Address that submitted the proposal |
+| `assetName` | uint64 | Target pool token name (ADD_POOL) |
+| `assetIssuer` | id | Target pool token issuer (ADD_POOL) |
+| `poolIndex` | uint64 | Target pool index (pool-indexed types) |
+| `newValue` | sint64 | Proposed value (parameter-update types) |
+| `withdrawAmount` | sint64 | QU amount (WITHDRAW_QU_RESERVE) |
+| `destination` | id | Recipient address (withdraw / sweep types) |
+| `votesYes` | sint64 | Total weighted YES shares (tallied at epoch end) |
+| `votesNo` | sint64 | Total weighted NO shares (tallied at epoch end) |
+| `feePaid` | sint64 | Proposal fee paid by the proposer |
+| `depositorVotesNo` | uint16 | Qualifying depositor NO (veto) votes for this slot |
+| `depositorVotesYes` | uint16 | Depositor YES votes for this slot |
+
+---
+
 ### GetGovernanceParams (Function ID 4)
 
 Returns all governable parameters in a single call. No input required.
@@ -752,7 +831,7 @@ Returns all governable parameters in a single call. No input required.
 ```
 ./qubic-cli -nodeip NODE_IP -nodeport NODE_PORT \
   -callcontractfunction CONTRACT_INDEX 4 "" \
-  "sint64,sint64,sint64,sint64,uint8,uint16,uint8,uint8,sint64,sint64"
+  "sint64,sint64,sint64,sint64,uint8,uint16,uint8,uint8,sint64,sint64,sint64,uint8,sint64,sint64,uint32,sint64,uint32,uint8"
 ```
 
 **Output fields in order:**
@@ -771,6 +850,12 @@ Returns all governable parameters in a single call. No input required.
 | `relockAddAmount` | sint64 | Min additional QU required to re-lock a vault position |
 | `execReserveFloor` | sint64 | Execution-fee-reserve safety floor; when the reserve drops below this, all profit is routed to the fee reserve (recovery preset) until it refills (0 = disabled) |
 | `inLimpMode` | uint8 | 1 if currently in recovery/limp mode (100% of profit routed to the fee reserve; the contract keeps trading); returns to 0 once the reserve reaches 10% above the floor |
+| `vixBreakoutFactor` | sint64 | VIX breakout sensitivity ×100 (200 = 2.00×): how far a token's recent volatility must exceed its own baseline to wake the Dagger |
+| `vixAbsFloorBps` | sint64 | Minimum absolute recent volatility (basis points) for a breakout to count |
+| `vixSampleInterval` | uint32 | Ticks between VIX price samples (345600 = 1/day, 172800 = 2/day, 115200 = 3/day) |
+| `swingSellPct` | sint64 | Cloak sell chunk: % of a held bag sold each time the +12% trigger fires |
+| `breakoutRescanTicks` | uint32 | Dagger hot re-scan pace in ticks (÷4 = seconds) while a pool is breaking out |
+| `qxFeeLivePerTrade` | uint8 | QX-fee source: 0 = per-epoch cached fee (default); 1 = fetch the QX fee live before each sell |
 
 ---
 
@@ -954,7 +1039,7 @@ the threshold (due to NAV changes) between the time you voted and epoch end, you
 ```
 ./qubic-cli -nodeip NODE_IP -nodeport NODE_PORT \
   -callcontractfunction CONTRACT_INDEX 4 "" \
-  "sint64,sint64,sint64,sint64,uint8,uint16,uint8,uint8,sint64,sint64"
+  "sint64,sint64,sint64,sint64,uint8,uint16,uint8,uint8,sint64,sint64,sint64,uint8,sint64,sint64,uint32,sint64,uint32,uint8"
 ```
 
 The 9th field is `depositorVoteMinQu`. Confirm your locked QU exceeds it.
@@ -1055,7 +1140,7 @@ the relevant function directly:
 ```
 ./qubic-cli -nodeip NODE_IP -nodeport NODE_PORT \
   -callcontractfunction CONTRACT_INDEX 4 "" \
-  "sint64,sint64,sint64,sint64,uint8,uint16,uint8,uint8,sint64,sint64"
+  "sint64,sint64,sint64,sint64,uint8,uint16,uint8,uint8,sint64,sint64,sint64,uint8,sint64,sint64,uint32,sint64,uint32,uint8"
 ```
 
 ---

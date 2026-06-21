@@ -67,27 +67,24 @@ struct CLKnDGR : public ContractBase
     // DEV_FUND_PCT  — stored in quReserve (contract-held, withdrawn via governance)
     // EXEC_FEE_PCT  — burned immediately via qpi.burn() to top up on-chain execution fees
     // ---------------------------------------------------------------
-    // Structure 0 — Default: 55% trading | 30% exec fees | 3% Qearn | 10% shareholders | 0% burn | 1% dev fund | 1% CCF
+    // Structure 0 — Default: 55% trading | 30% exec fees | 3% Qearn | 10% shareholders | 1% dev fund | 1% CCF
     static constexpr uint64 PAYOUT0_DEV_FUND_PCT  = 1;
     static constexpr uint64 PAYOUT0_EXEC_FEE_PCT  = 30;
     static constexpr uint64 PAYOUT0_DIST_PCT       = 10;
-    static constexpr uint64 PAYOUT0_BURN_PCT       = 0;
     static constexpr uint64 PAYOUT0_QEARN_PCT      = 3;
     static constexpr uint64 PAYOUT0_CCF_PCT        = 1;
 
-    // Structure 1 — Option 1: 61% trading | 27% exec fees | 3% Qearn | 7% shareholders | 0% burn | 1% dev fund | 1% CCF
+    // Structure 1 — Option 1: 61% trading | 27% exec fees | 3% Qearn | 7% shareholders | 1% dev fund | 1% CCF
     static constexpr uint64 PAYOUT1_DEV_FUND_PCT  = 1;
     static constexpr uint64 PAYOUT1_EXEC_FEE_PCT  = 27;
     static constexpr uint64 PAYOUT1_DIST_PCT       = 7;
-    static constexpr uint64 PAYOUT1_BURN_PCT       = 0;
     static constexpr uint64 PAYOUT1_QEARN_PCT      = 3;
     static constexpr uint64 PAYOUT1_CCF_PCT        = 1;
 
-    // Structure 2 — Option 2: 65% trading | 25% exec fees | 3% Qearn | 5% shareholders | 0% burn | 1% dev fund | 1% CCF
+    // Structure 2 — Option 2: 65% trading | 25% exec fees | 3% Qearn | 5% shareholders | 1% dev fund | 1% CCF
     static constexpr uint64 PAYOUT2_DEV_FUND_PCT  = 1;
     static constexpr uint64 PAYOUT2_EXEC_FEE_PCT  = 25;
     static constexpr uint64 PAYOUT2_DIST_PCT       = 5;
-    static constexpr uint64 PAYOUT2_BURN_PCT       = 0;
     static constexpr uint64 PAYOUT2_QEARN_PCT      = 3;
     static constexpr uint64 PAYOUT2_CCF_PCT        = 1;
 
@@ -99,7 +96,6 @@ struct CLKnDGR : public ContractBase
     static constexpr uint64 PAYOUT3_DEV_FUND_PCT  = 0;
     static constexpr uint64 PAYOUT3_EXEC_FEE_PCT  = 100;
     static constexpr uint64 PAYOUT3_DIST_PCT       = 0;
-    static constexpr uint64 PAYOUT3_BURN_PCT       = 0;
     static constexpr uint64 PAYOUT3_QEARN_PCT      = 0;
     static constexpr uint64 PAYOUT3_CCF_PCT        = 0;
 
@@ -110,11 +106,13 @@ struct CLKnDGR : public ContractBase
     static constexpr sint64 INITIAL_PROPOSAL_FEE_DEFAULT  = 50000000LL;  // 50M QU: default for most proposal types
     static constexpr sint64 INITIAL_PROPOSAL_FEE_ADD_POOL = 200000000LL; // 200M QU: adding a new pool
     static constexpr sint64 INITIAL_PROPOSAL_FEE_PAYOUT   = 69000000LL;  // 69M QU: changing payout structure
+    static constexpr uint64 PROPOSAL_FEE_EXEC_PCT         = 31;          // non-refundable % of a proposal fee routed to the exec-fee reserve (the other 69% is refunded on fail, or also reserve-funded on pass)
     static constexpr uint8  MAX_PROPOSALS_PER_EPOCH        = 10;
     static constexpr uint16 PROPOSAL_VOTER_CAPACITY        = 676;         // max unique voters = total IPO shares
     static constexpr uint16 INITIAL_MIN_VOTER_QUORUM       = 15;          // minimum unique qualified voters for consensus
     static constexpr uint16 MAX_VOTER_QUORUM               = 676;         // equals PROPOSAL_VOTER_CAPACITY — allows governance to require up to full shareholder participation
     static constexpr sint64 MIN_SHARES_QUORUM              = 222; // minimum total weighted shares voted (yes+no) for consensus; 222/676 = ~33% of supply — prevents small coalitions from passing proposals
+    static constexpr uint64 CONTRACT_SHARE_COUNT          = NUMBER_OF_COMPUTORS; // = 676; total IPO shares an epoch dividend is split across (qpi.distributeDividends pays per-share × this)
 
     // Depositor governance veto constants
     static constexpr uint16 MAX_DEPOSITORS           = 5000;         // max depositor vault slots; raised above IPO share count to allow broader participation
@@ -155,6 +153,7 @@ struct CLKnDGR : public ContractBase
     static constexpr uint32 COOLDOWN_TICKS_BASELINE      = 4838400; // 2 weeks @ 4 ticks/sec — safety-net scan for calm pools (catches standing arbs without frequent polling)
     static constexpr sint64 INITIAL_VIX_BREAKOUT_FACTOR  = 200;     // breakout when fast vol >= slow × 2.00× (stored ×100); governable via PROP_TYPE_UPDATE_VIX_FACTOR
     static constexpr sint64 INITIAL_VIX_ABS_FLOOR_BPS    = 25;      // ...AND fast vol >= 25 bps absolute (excludes near-dead tokens); governable via PROP_TYPE_UPDATE_VIX_FLOOR
+    static constexpr uint32 INITIAL_QX_TRANSFER_FEE      = 100;     // QX's share-transfer fee (QU). QX sets _transferFee=100 at INITIALIZE (since epoch 138) with no runtime setter, so it is constant in practice. Bootstrap for the qxTransferFee cache; refreshed live from QX during reserve liquidation.
 
     // Proposal types
     static constexpr uint8 PROP_TYPE_ADD_POOL              = 1;
@@ -179,6 +178,7 @@ struct CLKnDGR : public ContractBase
     static constexpr uint8 PROP_TYPE_UPDATE_VIX_PULSE_RATE    = 20; // update vixSampleInterval (VIX pulses per day); newValue = 1,2,3 (default 1)
     static constexpr uint8 PROP_TYPE_UPDATE_SWING_SELL_PCT    = 21; // update swingSellPct (Cloak sell chunk %); newValue = 10,15,20,25,33,50 (default 50)
     static constexpr uint8 PROP_TYPE_UPDATE_BREAKOUT_RESCAN   = 22; // update breakoutRescanTicks (Dagger hot re-scan pace); newValue = 30,60,120,180,240,300 seconds (default 300)
+    static constexpr uint8 PROP_TYPE_UPDATE_QX_FEE_MODE       = 23; // update qxFeeLivePerTrade (QX transfer-fee freshness); newValue = 0 (per-epoch cache, default) or 1 (fetch QX fee live before each sell — future-proof if QX ever makes its fee tick-variable)
 
     // ---------------------------------------------------------------
     // Direct action constants
@@ -270,6 +270,7 @@ struct CLKnDGR : public ContractBase
         uint32 vixSampleInterval;  // ticks between VIX pulses (345600=1/day, 172800=2/day, 115200=3/day)
         sint64 swingSellPct;       // Cloak sell chunk % per +12% trigger
         uint32 breakoutRescanTicks;// Dagger breakout re-scan pace (ticks; ÷4 = seconds)
+        uint8  qxFeeLivePerTrade;  // 0 = use cached QX fee (default), 1 = fetch QX fee live before each sell
     };
 
     struct submitProposal_input
@@ -411,17 +412,14 @@ struct CLKnDGR : public ContractBase
         uint64 activeDevFundPct;
         uint64 activeExecFeePct;
         uint64 activeDistPct;
-        uint64 activeBurnPct;
         uint64 activeQearnPct;
         uint64 activeCcfPct;
         uint64 devFundAmt;      // QU added to quReserve (dev fund) this epoch
         uint64 execFeeAmt;      // QU burned via qpi.burn() to top up execution fees this epoch
         uint64 distribAmount;
-        uint64 epochBurnAmount; // QU burned to NULL_ID each epoch
         uint64 ccfAmt;          // QU sent to Computer Controlled Fund each epoch
         // reserve burn/sell action (runs every RESERVE_ACTION_EPOCHS)
         uint64 i;
-        uint64 j;          // proposal slot clearing loop
         uint64 navRatio;   // precision-scaled NAV ratio (vaultCurBalance / prevTradingBalance × 1000) for overflow-safe update
         sint64 burnAmt;
         sint64 sellAmt;
@@ -443,7 +441,6 @@ struct CLKnDGR : public ContractBase
         Asset                     sellAsset; // for releaseShares call
         sint64 transferResult;
         uint64             qearnDonateAmt;
-        Proposal           emptyProp;  // scratch proposal used to clear the proposals array each epoch
         // Vault NAV update and auto-payout
         sint64 vaultCurBalance;     // contractBalance - quReserve - qearnReserve - qearnDonateAmt(this epoch) - waitlistQu
         sint64 vaultNewPool;        // updated totalDepositorPool after NAV ratio
@@ -512,10 +509,11 @@ struct CLKnDGR : public ContractBase
         QSWAP::TransferShareManagementRights_output swingTsrmOut;
         QX::AssetBidOrders_input  swingBidIn;
         QX::AssetBidOrders_output swingBidOut;
-        QX::Fees_input  swingFeesIn;
-        QX::Fees_output swingFeesOut;
         QX::AddToAskOrder_input  swingAskIn;
         QX::AddToAskOrder_output swingAskOut;
+        QX::Fees_input  swingFeesIn;    // only used when qxFeeLivePerTrade==1 (live QX-fee fetch per sell)
+        QX::Fees_output swingFeesOut;
+        uint32          effectiveQxFee; // QX transfer fee actually passed to releaseShares (cache, or live if toggled)
         Asset   swingAsset;
         sint64  swingPoolPrice;
         sint64  swingOneWeekPrice;
@@ -542,8 +540,9 @@ struct CLKnDGR : public ContractBase
         // performs the very same buy-Qswap / sell-into-QX-bid primitives:
         //   swingBidIn/swingBidOut   (QX AssetBidOrders)        — read the QX best bid
         //   swingBuyIn/swingBuyOut   (QSWAP SwapExactQuForAsset) — buy on Qswap
-        //   swingFeesIn/swingFeesOut (QX Fees)                   — transfer fee for releaseShares
         //   swingAskIn/swingAskOut   (QX AddToAskOrder)          — sell into the bid
+        //   swingFeesIn/swingFeesOut (QX Fees)                   — live QX fee, ONLY when qxFeeLivePerTrade==1
+        // (Default qxFeeLivePerTrade==0 reads the state.qxTransferFee cache, so the Fees scratch is unused.)
         // plus the Dagger's swapTsrmIn/swapTsrmOut, tradeAsset, transferResult and tradingBalance.
         // All are free by the time this loop runs. Only the QuoteExactAssetOutput scratch + scalars are new.
         QSWAP::QuoteExactAssetOutput_input  daQuoteIn;
@@ -720,6 +719,14 @@ struct CLKnDGR : public ContractBase
         uint32 vixSampleInterval;  // ticks between VIX pulses (345600=1/day default, 172800=2/day, 115200=3/day); governable via PROP_TYPE_UPDATE_VIX_PULSE_RATE
         sint64 swingSellPct;       // Cloak: % of a swing bag sold per +12% trigger; default 50; governable via PROP_TYPE_UPDATE_SWING_SELL_PCT
         uint32 breakoutRescanTicks;// Dagger: re-scan pace (ticks) while a pool is in a VIX breakout; default 1200 (5 min); governable via PROP_TYPE_UPDATE_BREAKOUT_RESCAN
+        uint32 qxTransferFee;      // cached QX share-transfer fee (QU). Bootstrapped to QX's constant (100 since
+                                   // epoch 138) and refreshed live whenever the reserve-liquidation path queries
+                                   // QX. The per-trade Cloak/Dagger sell legs read this instead of paying for a
+                                   // QX Fees lookup on every trade. Not governable — mirrors QX, not a CLKnDGR dial.
+        uint8  qxFeeLivePerTrade;  // QX-fee freshness mode: 0 = read the qxTransferFee cache each sell (default,
+                                   // cheapest); 1 = fetch the QX fee LIVE before each sell. Lets shareholders
+                                   // switch to live mode (via PROP_TYPE_UPDATE_QX_FEE_MODE) WITHOUT a re-deploy
+                                   // if QX ever makes its transfer fee vary tick-to-tick. Default 0 (implicit zero).
     };
 
     // ---------------------------------------------------------------
@@ -733,23 +740,24 @@ struct CLKnDGR : public ContractBase
     {
         state.mut().owner = id(1, 0, 0, 0); // DEPLOYMENT: replace with real deployer address
 
+        // The runtime zeroes the whole contract state before INITIALIZE runs, so fields whose initial
+        // value is 0 (counters, totals, and the payoutStructure / execReserveFloor / inLimpMode defaults)
+        // are left implicit; only non-zero defaults are set explicitly below. Matches the Qx / QThirtyFour
+        // idiom. (HashMaps still need .reset() — that is not a plain zero-fill; see below.)
         state.mut().minProfitQu                = MIN_PROFIT_QU;
         state.mut().proposalFeeDefault         = INITIAL_PROPOSAL_FEE_DEFAULT;
         state.mut().proposalFeeAddPool         = INITIAL_PROPOSAL_FEE_ADD_POOL;
         state.mut().proposalFeePayoutStructure = INITIAL_PROPOSAL_FEE_PAYOUT;
-        state.mut().payoutStructure            = 0;
         state.mut().minVoterQuorum             = INITIAL_MIN_VOTER_QUORUM;
-        state.mut().proposalsThisEpoch         = 0;
         // Reset governance vote maps so they are usable before the first BEGIN_EPOCH.
         // QPI HashMaps require reset() to be initialized; zero-init alone is not sufficient.
         // (Mirrors the resets in BEGIN_EPOCH; covers the post-IPO / pre-first-epoch window.)
-        state.mut().voterCount = 0;
         state.mut().proposalVoterMap.reset();
         state.mut().voterYesChoiceMap.reset();
         state.mut().depositorVoteMap.reset();
 
         // DEPLOYMENT ACTION: Set selfAsset so governance share-balance queries work.
-        // issuer  = id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0)  — already set below.
+        // issuer  = NULL_ID — set below (Qubic issues contract IPO shares under NULL_ID, not the contract id).
         // assetName = the IPO share name encoded as uint64 (7 ASCII chars, little-endian).
         //   Compute with: assetNameFromString("CLKNDGR") or confirm from the IPO registration.
         //   Until this is set, numberOfShares() returns 0 for all callers and no proposals
@@ -759,12 +767,8 @@ struct CLKnDGR : public ContractBase
 
         // Vault initialization
         state.mut().vaultSharePrice    = VAULT_INITIAL_SHARE_PRICE;
-        state.mut().totalVaultShares   = 0;
-        state.mut().totalDepositorPool = 0;
-        state.mut().prevTradingBalance = 0;
         state.mut().vaultDepositTier      = VAULT_INITIAL_DEPOSIT_TIER;
         state.mut().minReserveProfitPct   = 5; // initial threshold: 5%; governable via PROP_TYPE_UPDATE_RESERVE_PROFIT_PCT
-        state.mut().depositorCount        = 0;
         state.mut().depositorVoteMinQu    = 150000000LL; // initial: 150M QU; governable via PROP_TYPE_UPDATE_DEPOSITOR_VOTE_MIN
         state.mut().relockAddAmount       = INITIAL_RELOCK_ADD_AMOUNT;
         state.mut().vixBreakoutFactor     = INITIAL_VIX_BREAKOUT_FACTOR; // 2.00×; governable via PROP_TYPE_UPDATE_VIX_FACTOR
@@ -772,8 +776,7 @@ struct CLKnDGR : public ContractBase
         state.mut().vixSampleInterval      = INITIAL_VIX_SAMPLE_INTERVAL; // 1 pulse/day; governable via PROP_TYPE_UPDATE_VIX_PULSE_RATE
         state.mut().swingSellPct           = INITIAL_SWING_SELL_PCT;     // 50%; governable via PROP_TYPE_UPDATE_SWING_SELL_PCT
         state.mut().breakoutRescanTicks    = COOLDOWN_TICKS_BREAKOUT;    // 1200 ticks (5 min); governable via PROP_TYPE_UPDATE_BREAKOUT_RESCAN
-        state.mut().execReserveFloor      = 0; // safety valve disabled by default; shareholders enable it via governance once real fee rates are observed
-        state.mut().inLimpMode            = 0; // not in limp mode at init
+        state.mut().qxTransferFee          = INITIAL_QX_TRANSFER_FEE;    // 100 QU bootstrap; refreshed live from QX during reserve liquidation
     }
 
     // ---------------------------------------------------------------
@@ -809,24 +812,12 @@ struct CLKnDGR : public ContractBase
         state.mut().proposalVoterMap.reset();
         state.mut().voterYesChoiceMap.reset();
         state.mut().depositorVoteMap.reset();
-        locals.emptyProp.proposalType   = 0;
-        locals.emptyProp.status         = PROP_STATUS_EMPTY;
-        locals.emptyProp.proposer       = NULL_ID;
-        locals.emptyProp.assetName      = 0;
-        locals.emptyProp.assetIssuer    = NULL_ID;
-        locals.emptyProp.poolIndex      = 0;
-        locals.emptyProp.newValue       = 0;
-        locals.emptyProp.withdrawAmount = 0;
-        locals.emptyProp.destination    = NULL_ID;
-        locals.emptyProp.votesYes       = 0;
-        locals.emptyProp.votesNo        = 0;
-        locals.emptyProp.feePaid        = 0;
-        for (locals.j = 0; locals.j < MAX_PROPOSALS_PER_EPOCH; locals.j = locals.j + 1)
-        {
-            state.mut().proposals.set(locals.j, locals.emptyProp);
-            state.mut().depositorNoVotes.set(locals.j, 0);
-            state.mut().depositorYesVotes.set(locals.j, 0);
-        }
+        // Clear all proposal slots + depositor vote tallies for the new epoch. A zero-fill is a valid
+        // empty slot (PROP_STATUS_EMPTY == 0 and Proposal is POD), so use the QPI setMemory idiom
+        // instead of a field-by-field emptyProp + element loop. Ref qubic/core QThirtyFour.h.
+        setMemory(state.mut().proposals, 0);
+        setMemory(state.mut().depositorNoVotes, 0);
+        setMemory(state.mut().depositorYesVotes, 0);
 
         // --- Select active payout percentages from the governance-chosen preset ---
         // Safety valve: if the execution-fee reserve has fallen below the governable floor, this epoch
@@ -854,7 +845,6 @@ struct CLKnDGR : public ContractBase
             locals.activeDevFundPct = PAYOUT1_DEV_FUND_PCT;
             locals.activeExecFeePct = PAYOUT1_EXEC_FEE_PCT;
             locals.activeDistPct    = PAYOUT1_DIST_PCT;
-            locals.activeBurnPct    = PAYOUT1_BURN_PCT;
             locals.activeQearnPct   = PAYOUT1_QEARN_PCT;
             locals.activeCcfPct     = PAYOUT1_CCF_PCT;
         }
@@ -863,7 +853,6 @@ struct CLKnDGR : public ContractBase
             locals.activeDevFundPct = PAYOUT2_DEV_FUND_PCT;
             locals.activeExecFeePct = PAYOUT2_EXEC_FEE_PCT;
             locals.activeDistPct    = PAYOUT2_DIST_PCT;
-            locals.activeBurnPct    = PAYOUT2_BURN_PCT;
             locals.activeQearnPct   = PAYOUT2_QEARN_PCT;
             locals.activeCcfPct     = PAYOUT2_CCF_PCT;
         }
@@ -872,7 +861,6 @@ struct CLKnDGR : public ContractBase
             locals.activeDevFundPct = PAYOUT3_DEV_FUND_PCT;
             locals.activeExecFeePct = PAYOUT3_EXEC_FEE_PCT;
             locals.activeDistPct    = PAYOUT3_DIST_PCT;
-            locals.activeBurnPct    = PAYOUT3_BURN_PCT;
             locals.activeQearnPct   = PAYOUT3_QEARN_PCT;
             locals.activeCcfPct     = PAYOUT3_CCF_PCT;
         }
@@ -881,7 +869,6 @@ struct CLKnDGR : public ContractBase
             locals.activeDevFundPct = PAYOUT0_DEV_FUND_PCT;
             locals.activeExecFeePct = PAYOUT0_EXEC_FEE_PCT;
             locals.activeDistPct    = PAYOUT0_DIST_PCT;
-            locals.activeBurnPct    = PAYOUT0_BURN_PCT;
             locals.activeQearnPct   = PAYOUT0_QEARN_PCT;
             locals.activeCcfPct     = PAYOUT0_CCF_PCT;
         }
@@ -1098,18 +1085,14 @@ struct CLKnDGR : public ContractBase
                 qpi.burn(locals.execFeeAmt);
             }
 
-            // Variable % to shareholders
+            // Variable % to shareholders. qpi.distributeDividends takes a PER-SHARE amount and pays
+            // it to all 676 contract shares (total = 676 × arg), so divide the total dividend by 676.
+            // (Matches Qx/QVAULT/Nostromo/etc.) Passing the total here would try to pay 676× and the
+            // call would fail its balance check — shareholders would receive nothing.
             locals.distribAmount = div((uint64)state.get().epochProfit * locals.activeDistPct, (uint64)100);
             if (locals.distribAmount > 0)
             {
-                qpi.distributeDividends((sint64)locals.distribAmount);
-            }
-
-            // Variable % burned — sent to NULL_ID (AAAAAA...FXIB), permanently removed from supply
-            locals.epochBurnAmount = div((uint64)state.get().epochProfit * locals.activeBurnPct, (uint64)100);
-            if (locals.epochBurnAmount > 0)
-            {
-                qpi.transfer(NULL_ID, locals.epochBurnAmount);
+                qpi.distributeDividends((sint64)div(locals.distribAmount, CONTRACT_SHARE_COUNT));
             }
 
             // Variable % to Computer Controlled Fund: IAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABXSH = ID(8,0,0,0)
@@ -1213,8 +1196,8 @@ struct CLKnDGR : public ContractBase
                     locals.transferResult = qpi.transferShareOwnershipAndPossession(
                         state.get().poolAssetNames.get(locals.i),
                         state.get().poolIssuers.get(locals.i),
-                        id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0),
-                        id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0),
+                        SELF,
+                        SELF,
                         locals.burnAmt,
                         NULL_ID
                     );
@@ -1228,13 +1211,17 @@ struct CLKnDGR : public ContractBase
                 locals.addAskOut.addedNumberOfShares = 0;
                 if (locals.sellAmt > 0)
                 {
+                    // This BEGIN_EPOCH path already pays for a QX Fees lookup, so use it to refresh the
+                    // qxTransferFee cache from the live QX value. The per-trade Cloak/Dagger sell legs then
+                    // read the cache (state.qxTransferFee) instead of each paying for their own Fees call.
                     { CALL_OTHER_CONTRACT_FUNCTION(QX, Fees, locals.feesIn, locals.feesOut); }
+                    state.mut().qxTransferFee = locals.feesOut.transferFee;
                     locals.sellAsset.issuer    = state.get().poolIssuers.get(locals.i);
                     locals.sellAsset.assetName = state.get().poolAssetNames.get(locals.i);
                     locals.transferResult = qpi.releaseShares(
                         locals.sellAsset,
-                        id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0),
-                        id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0),
+                        SELF,
+                        SELF,
                         locals.sellAmt,
                         QX_CONTRACT_INDEX, QX_CONTRACT_INDEX,
                         locals.feesOut.transferFee
@@ -1451,7 +1438,7 @@ struct CLKnDGR : public ContractBase
                 // Passed → the fee is non-refundable; send the held 69% to the execution-fee reserve
                 // (the 31% non-refundable share already went there at submission, so 100% of a passed
                 // proposal's fee now funds execution). Guarded by the running balance like the refunds.
-                locals.execBurnAmt = locals.prop.feePaid - (sint64)div((uint64)locals.prop.feePaid * 31ULL, (uint64)100);
+                locals.execBurnAmt = locals.prop.feePaid - (sint64)div((uint64)locals.prop.feePaid * PROPOSAL_FEE_EXEC_PCT, (uint64)100);
                 if (locals.execBurnAmt > 0 && locals.execBurnAmt <= locals.availableBalance)
                 {
                     qpi.burn((uint64)locals.execBurnAmt);
@@ -1655,6 +1642,13 @@ struct CLKnDGR : public ContractBase
                         state.mut().breakoutRescanTicks = (uint32)((uint64)locals.prop.newValue * 4ULL);
                     }
                 }
+                else if (locals.prop.proposalType == PROP_TYPE_UPDATE_QX_FEE_MODE)
+                {
+                    if (locals.prop.newValue == 0LL || locals.prop.newValue == 1LL)
+                    {
+                        state.mut().qxFeeLivePerTrade = (uint8)locals.prop.newValue;
+                    }
+                }
                 else if (locals.prop.proposalType == PROP_TYPE_WITHDRAW_ASSET_RESERVE)
                 {
                     if (locals.prop.poolIndex < (uint64)state.get().poolCount &&
@@ -1664,8 +1658,8 @@ struct CLKnDGR : public ContractBase
                         locals.withdrawAsset.assetName = state.get().poolAssetNames.get(locals.prop.poolIndex);
                         locals.actualAssetBalance = qpi.numberOfShares(
                             locals.withdrawAsset,
-                            AssetOwnershipSelect{ id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0), CLKnDGR_CONTRACT_INDEX },
-                            AssetPossessionSelect{ id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0), CLKnDGR_CONTRACT_INDEX }
+                            AssetOwnershipSelect{ SELF, CLKnDGR_CONTRACT_INDEX },
+                            AssetPossessionSelect{ SELF, CLKnDGR_CONTRACT_INDEX }
                         );
                         if (locals.actualAssetBalance > 0)
                         {
@@ -1676,8 +1670,8 @@ struct CLKnDGR : public ContractBase
                             locals.transferResult = qpi.transferShareOwnershipAndPossession(
                                 state.get().poolAssetNames.get(locals.prop.poolIndex),
                                 state.get().poolIssuers.get(locals.prop.poolIndex),
-                                id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0),
-                                id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0),
+                                SELF,
+                                SELF,
                                 locals.actualAssetBalance,
                                 locals.prop.destination
                             );
@@ -1739,8 +1733,8 @@ struct CLKnDGR : public ContractBase
                             // Defensive: never release more than CLKnDGR actually owns+manages on-chain.
                             locals.actualAssetBalance = qpi.numberOfShares(
                                 locals.withdrawAsset,
-                                AssetOwnershipSelect{ id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0), CLKnDGR_CONTRACT_INDEX },
-                                AssetPossessionSelect{ id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0), CLKnDGR_CONTRACT_INDEX }
+                                AssetOwnershipSelect{ SELF, CLKnDGR_CONTRACT_INDEX },
+                                AssetPossessionSelect{ SELF, CLKnDGR_CONTRACT_INDEX }
                             );
                             if (locals.actualAssetBalance >= locals.sellTotalAmt)
                             {
@@ -1748,8 +1742,8 @@ struct CLKnDGR : public ContractBase
                                 // fee (0 here) on success, < 0 on failure — check < 0, not <= 0.
                                 locals.transferResult = qpi.releaseShares(
                                     locals.withdrawAsset,
-                                    id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0),
-                                    id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0),
+                                    SELF,
+                                    SELF,
                                     locals.sellTotalAmt,
                                     QSWAP_CONTRACT_INDEX, QSWAP_CONTRACT_INDEX,
                                     0
@@ -2156,17 +2150,24 @@ struct CLKnDGR : public ContractBase
                         continue; // insufficient liquidity — wait for next check
                     }
 
-                    // Give QX managing rights via releaseShares (pays transfer fee)
-                    { CALL_OTHER_CONTRACT_FUNCTION(QX, Fees, locals.swingFeesIn, locals.swingFeesOut); }
+                    // Give QX managing rights via releaseShares. The transfer fee is the per-epoch
+                    // qxTransferFee cache by default; if shareholders enabled live mode (qxFeeLivePerTrade,
+                    // for if QX ever makes its fee tick-variable) fetch it fresh from QX for this sell.
+                    locals.effectiveQxFee = state.get().qxTransferFee;
+                    if (state.get().qxFeeLivePerTrade)
+                    {
+                        { CALL_OTHER_CONTRACT_FUNCTION(QX, Fees, locals.swingFeesIn, locals.swingFeesOut); }
+                        locals.effectiveQxFee = locals.swingFeesOut.transferFee;
+                    }
                     locals.swingAsset.issuer    = state.get().poolIssuers.get(locals.i);
                     locals.swingAsset.assetName = state.get().poolAssetNames.get(locals.i);
                     locals.transferResult = qpi.releaseShares(
                         locals.swingAsset,
-                        id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0),
-                        id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0),
+                        SELF,
+                        SELF,
                         locals.swingSellAmt,
                         QX_CONTRACT_INDEX, QX_CONTRACT_INDEX,
-                        locals.swingFeesOut.transferFee);
+                        locals.effectiveQxFee);
                     if (locals.transferResult < 0) { continue; } // rights transfer failed — skip
 
                     // Place ask order on QX
@@ -2566,8 +2567,8 @@ struct CLKnDGR : public ContractBase
                     locals.tradeAsset.assetName = locals.poolIn.assetName;
                     locals.transferResult = qpi.releaseShares(
                         locals.tradeAsset,
-                        id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0),
-                        id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0),
+                        SELF,
+                        SELF,
                         locals.sellAmt,
                         QSWAP_CONTRACT_INDEX, QSWAP_CONTRACT_INDEX,
                         0  // QSWAP PRE_ACQUIRE_SHARES accepts at no fee
@@ -2804,17 +2805,24 @@ struct CLKnDGR : public ContractBase
                     continue;
                 }
 
-                // Leg 3a: give QX managing rights for the sell portion (pays QX transfer fee).
-                { CALL_OTHER_CONTRACT_FUNCTION(QX, Fees, locals.swingFeesIn, locals.swingFeesOut); }
+                // Leg 3a: give QX managing rights for the sell portion. Transfer fee = the per-epoch
+                // qxTransferFee cache by default, or a live QX fetch when qxFeeLivePerTrade is enabled
+                // (same future-proofing toggle as the Cloak sell leg above).
+                locals.effectiveQxFee = state.get().qxTransferFee;
+                if (state.get().qxFeeLivePerTrade)
+                {
+                    { CALL_OTHER_CONTRACT_FUNCTION(QX, Fees, locals.swingFeesIn, locals.swingFeesOut); }
+                    locals.effectiveQxFee = locals.swingFeesOut.transferFee;
+                }
                 locals.tradeAsset.issuer    = locals.poolIn.assetIssuer;
                 locals.tradeAsset.assetName = locals.poolIn.assetName;
                 locals.transferResult = qpi.releaseShares(
                     locals.tradeAsset,
-                    id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0),
-                    id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0),
+                    SELF,
+                    SELF,
                     locals.daSellAmt,
                     QX_CONTRACT_INDEX, QX_CONTRACT_INDEX,
-                    locals.swingFeesOut.transferFee);
+                    locals.effectiveQxFee);
                 if (locals.transferResult < 0)
                 {
                     // QX rejected the rights transfer — nothing was released. Fold ALL reclaimed tokens
@@ -2911,7 +2919,7 @@ struct CLKnDGR : public ContractBase
 
         // Validate proposal type — full refund on rejection (mirrors the insufficient-fee path below).
         if (input.proposalType < PROP_TYPE_ADD_POOL ||
-            input.proposalType > PROP_TYPE_UPDATE_BREAKOUT_RESCAN)
+            input.proposalType > PROP_TYPE_UPDATE_QX_FEE_MODE)
         {
             if (qpi.invocationReward() > 0) { qpi.transfer(qpi.invocator(), qpi.invocationReward()); }
             return;
@@ -3083,6 +3091,11 @@ struct CLKnDGR : public ContractBase
             if (input.newValue != 30LL  && input.newValue != 60LL  && input.newValue != 120LL &&
                 input.newValue != 180LL && input.newValue != 240LL && input.newValue != 300LL) { locals.contentValid = 0; }
         }
+        if (locals.contentValid && input.proposalType == PROP_TYPE_UPDATE_QX_FEE_MODE)
+        {
+            // QX transfer-fee freshness: 0 = per-epoch cache (default), 1 = live fetch before each sell.
+            if (input.newValue != 0LL && input.newValue != 1LL) { locals.contentValid = 0; }
+        }
 
         // Reject duplicate proposals: prevent two conflicting proposals of the same type in one epoch.
         // Pool-indexed types conflict only if the same poolIndex is targeted; ADD_POOL conflicts only
@@ -3143,7 +3156,7 @@ struct CLKnDGR : public ContractBase
         // Proposal fees fund the execution-fee reserve (no supply burn, none kept as trading capital).
         // The non-refundable 31% is routed to the reserve now via qpi.burn(); on a PASS the held 69%
         // is also sent to the reserve at END_EPOCH, and on a FAIL that 69% is refunded to the proposer.
-        locals.feeExecAmt = (sint64)div((uint64)locals.requiredFee * 31, (uint64)100);
+        locals.feeExecAmt = (sint64)div((uint64)locals.requiredFee * PROPOSAL_FEE_EXEC_PCT, (uint64)100);
         if (locals.feeExecAmt > 0)
         {
             qpi.burn((uint64)locals.feeExecAmt);
@@ -3307,6 +3320,7 @@ struct CLKnDGR : public ContractBase
         output.vixSampleInterval          = state.get().vixSampleInterval;
         output.swingSellPct               = state.get().swingSellPct;
         output.breakoutRescanTicks        = state.get().breakoutRescanTicks;
+        output.qxFeeLivePerTrade          = state.get().qxFeeLivePerTrade;
         output.inLimpMode                 = state.get().inLimpMode;
     }
 
