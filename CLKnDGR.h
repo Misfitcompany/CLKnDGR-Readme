@@ -26,7 +26,9 @@ struct CLKnDGR : public ContractBase
     static constexpr uint8  RESERVE_ACTION_EPOCHS  = 4;   // epoch interval for reserve burn/sell
     // minReserveProfitPct is a governable state field (initial: 5); valid values: 2, 5, 7, 10
     static constexpr sint64 QEARN_DONATE_THRESHOLD = 10101010LL; // QU accumulated across epochs before the Qearn slice is donated to Qearn's bonus pool
-    // minProfitQu valid governance values — allowlist prevents values that mechanically break Dagger (too low) or render it permanently inactive (too high)
+    // minProfitQu = minimum NET profit per arb, AFTER the Qswap swap fee (the gates/guards add the fee
+    // back when comparing). Valid governance values — allowlist prevents values that mechanically break
+    // Dagger (too low) or render it permanently inactive (too high).
     static constexpr sint64 MIN_PROFIT_QU_OPT1 = 100100LL;  // default
     static constexpr sint64 MIN_PROFIT_QU_OPT2 = 250100LL;
     static constexpr sint64 MIN_PROFIT_QU_OPT3 = 420000LL;
@@ -626,7 +628,7 @@ struct CLKnDGR : public ContractBase
         // same approach as qRWA's mQmineAsset.
         Asset selfAsset;
 
-        sint64 minProfitQu;               // runtime version of MIN_PROFIT_QU (initial: 100,100 QU)
+        sint64 minProfitQu;               // runtime MIN_PROFIT_QU: minimum NET profit/arb after the Qswap fee (initial 100,100)
         sint64 proposalFeeDefault;        // QU required for most proposal types (initial: 50,000,000 QU)
         sint64 proposalFeeAddPool;        // QU required for AddPool proposals (initial: 200,000,000 QU)
         sint64 proposalFeePayoutStructure; // QU required for UpdatePayout proposals (initial: 69,000,000 QU)
@@ -1765,7 +1767,9 @@ struct CLKnDGR : public ContractBase
                                     // quAmountOut - 10% via subtraction of (quote/10): overflow-safe, no ×10.
                                     locals.sellSwapIn.quAmountOutMin = locals.sellQaOut.quAmountOut
                                         - (sint64)div((uint64)locals.sellQaOut.quAmountOut, (uint64)10);
-                                    { INVOKE_OTHER_CONTRACT_PROCEDURE(QSWAP, SwapExactAssetForQu, locals.sellSwapIn, locals.sellSwapOut, 0); }
+                                    // Qswap skims QSWAP_ADDITIONAL_FEE from the invocation reward; pass it
+                                    // (was 0, which reverted the liquidation sell every time).
+                                    { INVOKE_OTHER_CONTRACT_PROCEDURE(QSWAP, SwapExactAssetForQu, locals.sellSwapIn, locals.sellSwapOut, QSWAP_ADDITIONAL_FEE); }
 
                                     // Tokens left both buckets either way (sold for QU, or now stuck under
                                     // Qswap rights awaiting recovery). Reduce each bucket and its cost basis
@@ -1795,8 +1799,9 @@ struct CLKnDGR : public ContractBase
                                     {
                                         // Success: route QU to reserveSellProceeds (folded into epochProfit
                                         // at the next BEGIN_EPOCH, after NAV — same path as the reserve sell).
-                                        state.mut().reserveSellProceeds = state.get().reserveSellProceeds + locals.sellSwapOut.quAmountOut;
-                                        state.mut().totalProfitEarned   = state.get().totalProfitEarned   + locals.sellSwapOut.quAmountOut;
+                                        // Net of the Qswap swap fee paid above (real QU that left the contract).
+                                        state.mut().reserveSellProceeds = state.get().reserveSellProceeds + (locals.sellSwapOut.quAmountOut - QSWAP_ADDITIONAL_FEE);
+                                        state.mut().totalProfitEarned   = state.get().totalProfitEarned   + (locals.sellSwapOut.quAmountOut - QSWAP_ADDITIONAL_FEE);
                                     }
                                     else
                                     {
@@ -2308,7 +2313,7 @@ struct CLKnDGR : public ContractBase
                     (uint64)100); // 1% first buy
             }
 
-            if (locals.swingBuyQu <= 0 || locals.swingBuyQu > locals.tradingBalance) { continue; } // nothing to buy this check
+            if (locals.swingBuyQu <= 0 || locals.swingBuyQu + QSWAP_ADDITIONAL_FEE > locals.tradingBalance) { continue; } // nothing to buy (incl. Qswap swap fee)
 
             // Quote expected token output for slippage floor
             locals.swingQuoteIn.assetIssuer = state.get().poolIssuers.get(locals.i);
@@ -2325,12 +2330,13 @@ struct CLKnDGR : public ContractBase
             locals.swingBuyIn.assetAmountOutMin = locals.swingQuoteOut.assetAmountOut -
                 (sint64)div((uint64)locals.swingQuoteOut.assetAmountOut * (uint64)SWING_BUY_SLIPPAGE_PCT,
                             (uint64)100);
-            { INVOKE_OTHER_CONTRACT_PROCEDURE(QSWAP, SwapExactQuForAsset, locals.swingBuyIn, locals.swingBuyOut, locals.swingBuyQu); }
+            // Attach the Qswap swap fee on top of swingBuyQu; Qswap skims the fee then swaps swingBuyQu.
+            { INVOKE_OTHER_CONTRACT_PROCEDURE(QSWAP, SwapExactQuForAsset, locals.swingBuyIn, locals.swingBuyOut, locals.swingBuyQu + QSWAP_ADDITIONAL_FEE); }
 
             if (locals.swingBuyOut.assetAmountOut <= 0) { continue; } // swap failed or excess slippage
 
-            // Deduct spent QU from tradingBalance so later pools in this tick see real remaining capital
-            locals.tradingBalance = locals.tradingBalance - locals.swingBuyQu;
+            // Deduct spent QU + swap fee from tradingBalance so later pools in this tick see real remaining capital
+            locals.tradingBalance = locals.tradingBalance - (locals.swingBuyQu + QSWAP_ADDITIONAL_FEE);
             if (locals.tradingBalance < 0) { locals.tradingBalance = 0; }
 
             // TSRM: tokens arrived under Qswap managing rights — reclaim for CLKnDGR
@@ -2504,16 +2510,25 @@ struct CLKnDGR : public ContractBase
             locals.qaIn.assetAmountIn = locals.addBidIn.numberOfShares;
             { CALL_OTHER_CONTRACT_FUNCTION(QSWAP, QuoteExactAssetInput, locals.qaIn, locals.qaOut); }
 
-            locals.estimatedProfit = locals.qaOut.quAmountOut - locals.quCostOnQx;
+            // Realized margin, NOT gross: only (100 − RESERVE_PCT)% of the bought shares are sold on
+            // Qswap (the rest is retained as reserve), yet the FULL QX cost was paid. Subtract the
+            // reserve's share of the quote so the gate + scale-down size the trade on what is actually
+            // realized. Sizing on gross would let a big arb scale down until the 90% sale can no longer
+            // clear the slippage guard, reverting the swap (task #50). Direction A already sizes this way.
+            locals.estimatedProfit = locals.qaOut.quAmountOut
+                - (sint64)div((uint64)locals.qaOut.quAmountOut * (uint64)RESERVE_PCT, (uint64)100)
+                - locals.quCostOnQx;
 
-            if (locals.estimatedProfit > state.get().minProfitQu)
+            // minProfitQu is the NET floor (profit AFTER the Qswap swap fee). estimatedProfit is the
+            // realized margin, so the trade must clear minProfitQu + the fee to net minProfitQu.
+            if (locals.estimatedProfit > state.get().minProfitQu + QSWAP_ADDITIONAL_FEE)
             {
-                // Cap trade size to target ~minProfitQu profit per pool per tick.
+                // Cap trade size to target ~minProfitQu NET profit per pool per tick.
                 // With many pools active simultaneously, allowing each to trade at max size would
                 // exhaust the QU balance early in the loop, starving later pools.
-                // Scale down by (estimatedProfit / minProfitQu) — integer division, so actual profit
+                // Scale down by (realized / (minProfitQu + fee)) — integer division, so actual net profit
                 // will be slightly above minProfitQu due to reduced AMM price impact on smaller trades.
-                locals.scaleFactor = (sint64)div((uint64)locals.estimatedProfit, (uint64)state.get().minProfitQu);
+                locals.scaleFactor = (sint64)div((uint64)locals.estimatedProfit, (uint64)(state.get().minProfitQu + QSWAP_ADDITIONAL_FEE));
                 if (locals.scaleFactor > 1)
                 {
                     locals.addBidIn.numberOfShares = (sint64)div((uint64)locals.addBidIn.numberOfShares, (uint64)locals.scaleFactor);
@@ -2599,8 +2614,11 @@ struct CLKnDGR : public ContractBase
                 // (quAmountOut − quCostOnQx) ≥ minProfitQu even when reserveAmt > 0. The prior
                 // sellAmt × price guard understated the minimum by reserveAmt × price, allowing
                 // below-threshold (or negative) net profit on expensive tokens with ≥10-share fills.
-                locals.swapAssetIn.quAmountOutMin = locals.quCostOnQx + state.get().minProfitQu;
-                { INVOKE_OTHER_CONTRACT_PROCEDURE(QSWAP, SwapExactAssetForQu, locals.swapAssetIn, locals.swapAssetOut, 0); }
+                // NET floor: proceeds must cover the QX cost + the Qswap swap fee + the minProfitQu net margin.
+                locals.swapAssetIn.quAmountOutMin = locals.quCostOnQx + state.get().minProfitQu + QSWAP_ADDITIONAL_FEE;
+                // Qswap skims QSWAP_ADDITIONAL_FEE from the invocation reward on a sell; the sale
+                // proceeds return separately. Passing 0 (the old value) made Qswap revert every sell.
+                { INVOKE_OTHER_CONTRACT_PROCEDURE(QSWAP, SwapExactAssetForQu, locals.swapAssetIn, locals.swapAssetOut, QSWAP_ADDITIONAL_FEE); }
 
                 if (locals.swapAssetOut.quAmountOut <= 0)
                 {
@@ -2632,9 +2650,12 @@ struct CLKnDGR : public ContractBase
                 }
 
                 state.mut().totalArbsExecuted = state.get().totalArbsExecuted + 1;
-                if (locals.swapAssetOut.quAmountOut > locals.quCostOnQx)
+                if (locals.swapAssetOut.quAmountOut > locals.quCostOnQx + QSWAP_ADDITIONAL_FEE)
                 {
-                    locals.estimatedProfit = locals.swapAssetOut.quAmountOut - locals.quCostOnQx;
+                    // Book profit NET of the Qswap swap fee (paid as the invocation reward above) — the
+                    // fee is real QU that left the contract, so booking gross would overstate epochProfit
+                    // and over-distribute at BEGIN_EPOCH.
+                    locals.estimatedProfit = locals.swapAssetOut.quAmountOut - locals.quCostOnQx - QSWAP_ADDITIONAL_FEE;
                     state.mut().totalProfitEarned = state.get().totalProfitEarned + locals.estimatedProfit;
                     state.mut().epochProfit       = state.get().epochProfit       + locals.estimatedProfit;
                 }
@@ -2708,14 +2729,16 @@ struct CLKnDGR : public ContractBase
             // Capital cap: if we cannot afford the full target, scale the token count down to fit
             // current capital and re-quote. Smaller trades incur less Qswap slippage, so this never
             // worsens per-token economics (same reasoning as Direction B's affordability cap).
-            if (locals.daBuyQu > locals.tradingBalance)
+            if (locals.daBuyQu + QSWAP_ADDITIONAL_FEE > locals.tradingBalance)
             {
-                locals.daTargetTokens = (sint64)div((uint64)locals.daTargetTokens * (uint64)locals.tradingBalance, (uint64)locals.daBuyQu);
+                // Reserve the Qswap swap fee: only (tradingBalance - fee) can go INTO the swap.
+                // tradingBalance >= minProfitQu (> fee) is guaranteed by the gate at loop top.
+                locals.daTargetTokens = (sint64)div((uint64)locals.daTargetTokens * (uint64)(locals.tradingBalance - QSWAP_ADDITIONAL_FEE), (uint64)locals.daBuyQu);
                 if (locals.daTargetTokens <= 0) { continue; } // even 1 token costs more than our capital — retry next tick
                 locals.daQuoteIn.assetAmountOut = locals.daTargetTokens;
                 { CALL_OTHER_CONTRACT_FUNCTION(QSWAP, QuoteExactAssetOutput, locals.daQuoteIn, locals.daQuoteOut); }
                 locals.daBuyQu = locals.daQuoteOut.quAmountIn;
-                if (locals.daBuyQu <= 0 || locals.daBuyQu > locals.tradingBalance) { continue; }
+                if (locals.daBuyQu <= 0 || locals.daBuyQu + QSWAP_ADDITIONAL_FEE > locals.tradingBalance) { continue; }
             }
 
             // Estimated split and proceeds (proceeds land next tick; this is the profitability gate).
@@ -2725,11 +2748,13 @@ struct CLKnDGR : public ContractBase
             locals.daProceeds  = (sint64)((uint64)locals.daSellAmt * (uint64)locals.daBidPrice);
             locals.daEstProfit = locals.daProceeds - locals.daBuyQu;
 
-            if (locals.daEstProfit > state.get().minProfitQu)
+            // minProfitQu is the NET floor; daEstProfit is gross (QX-bid proceeds − Qswap buy cost),
+            // so require gross > minProfitQu + the Qswap swap fee to net minProfitQu.
+            if (locals.daEstProfit > state.get().minProfitQu + QSWAP_ADDITIONAL_FEE)
             {
-                // Capital-spread scale-down (mirrors Direction B): when profit >> minProfitQu, shrink the
+                // Capital-spread scale-down (mirrors Direction B): when net profit >> minProfitQu, shrink the
                 // trade so a single pool does not exhaust capital before later pools are checked.
-                locals.daScaleFactor = (sint64)div((uint64)locals.daEstProfit, (uint64)state.get().minProfitQu);
+                locals.daScaleFactor = (sint64)div((uint64)locals.daEstProfit, (uint64)(state.get().minProfitQu + QSWAP_ADDITIONAL_FEE));
                 if (locals.daScaleFactor > 1)
                 {
                     locals.daTargetTokens = (sint64)div((uint64)locals.daTargetTokens, (uint64)locals.daScaleFactor);
@@ -2737,13 +2762,13 @@ struct CLKnDGR : public ContractBase
                     locals.daQuoteIn.assetAmountOut = locals.daTargetTokens;
                     { CALL_OTHER_CONTRACT_FUNCTION(QSWAP, QuoteExactAssetOutput, locals.daQuoteIn, locals.daQuoteOut); }
                     locals.daBuyQu = locals.daQuoteOut.quAmountIn;
-                    if (locals.daBuyQu <= 0 || locals.daBuyQu > locals.tradingBalance) { continue; }
+                    if (locals.daBuyQu <= 0 || locals.daBuyQu + QSWAP_ADDITIONAL_FEE > locals.tradingBalance) { continue; }
                     locals.daReserveAmt = (sint64)div((uint64)locals.daTargetTokens * (uint64)RESERVE_PCT, (uint64)100);
                     locals.daSellAmt    = locals.daTargetTokens - locals.daReserveAmt;
                     if (locals.daSellAmt <= 0) { state.mut().poolCooldownTickA.set(locals.i, qpi.tick() + locals.cooldownNoArb); continue; }
                     locals.daProceeds   = (sint64)((uint64)locals.daSellAmt * (uint64)locals.daBidPrice);
                     // Re-verify profit after the smaller re-quote before committing capital.
-                    if (locals.daProceeds < locals.daBuyQu + state.get().minProfitQu) { state.mut().poolCooldownTickA.set(locals.i, qpi.tick() + locals.cooldownNoArb); continue; }
+                    if (locals.daProceeds < locals.daBuyQu + state.get().minProfitQu + QSWAP_ADDITIONAL_FEE) { state.mut().poolCooldownTickA.set(locals.i, qpi.tick() + locals.cooldownNoArb); continue; }
                 }
 
                 // Leg 1: buy daTargetTokens on Qswap, spending exactly daBuyQu (5% slippage floor on tokens out).
@@ -2751,12 +2776,13 @@ struct CLKnDGR : public ContractBase
                 locals.swingBuyIn.assetName         = locals.poolIn.assetName;
                 locals.swingBuyIn.assetAmountOutMin = locals.daTargetTokens -
                     (sint64)div((uint64)locals.daTargetTokens * (uint64)SWING_BUY_SLIPPAGE_PCT, (uint64)100);
-                { INVOKE_OTHER_CONTRACT_PROCEDURE(QSWAP, SwapExactQuForAsset, locals.swingBuyIn, locals.swingBuyOut, locals.daBuyQu); }
+                // Attach the Qswap swap fee on top of the QU to swap; Qswap skims the fee then swaps daBuyQu.
+                { INVOKE_OTHER_CONTRACT_PROCEDURE(QSWAP, SwapExactQuForAsset, locals.swingBuyIn, locals.swingBuyOut, locals.daBuyQu + QSWAP_ADDITIONAL_FEE); }
 
                 if (locals.swingBuyOut.assetAmountOut <= 0) { continue; } // swap failed or excess slippage — QU not committed
 
-                // Exact-QU-in swap spends the full daBuyQu; reflect it so later pools see real capital.
-                locals.tradingBalance = locals.tradingBalance - locals.daBuyQu;
+                // Exact-QU-in swap spends the full daBuyQu plus the swap fee; reflect both so later pools see real capital.
+                locals.tradingBalance = locals.tradingBalance - (locals.daBuyQu + QSWAP_ADDITIONAL_FEE);
                 if (locals.tradingBalance < 0) { locals.tradingBalance = 0; }
 
                 // Leg 2: tokens arrived under Qswap managing rights — reclaim for CLKnDGR.
@@ -2798,7 +2824,7 @@ struct CLKnDGR : public ContractBase
                 // so the retained reserve is pure upside. If it no longer clears, do NOT sell at a thin
                 // margin: fold the cheaply-bought tokens into reserve for the liquidation engine to
                 // realize later. No forced loss.
-                if ((sint64)((uint64)locals.daSellAmt * (uint64)locals.daBidPrice) < locals.daBuyQu + state.get().minProfitQu)
+                if ((sint64)((uint64)locals.daSellAmt * (uint64)locals.daBidPrice) < locals.daBuyQu + state.get().minProfitQu + QSWAP_ADDITIONAL_FEE)
                 {
                     state.mut().poolReserveTokens.set(locals.i,    state.get().poolReserveTokens.get(locals.i)    + locals.daTotalTokens);
                     state.mut().poolReserveCostBasis.set(locals.i, state.get().poolReserveCostBasis.get(locals.i) + locals.daBuyQu);

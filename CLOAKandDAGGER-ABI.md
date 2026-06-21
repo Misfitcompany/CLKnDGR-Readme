@@ -290,11 +290,15 @@ Re-enable a previously deactivated pool.
 
 #### Type 4 — UPDATE_MIN_PROFIT
 
-Change the minimum profit threshold (in QU) required before a trade executes.
+Change the minimum **net** profit per arb (in QU) required before a trade executes. "Net" means after the
+Qswap swap fee — the gates and slippage guards add the fee back internally, so this value is what the
+contract keeps per arb.
 
 **Fee:** 50,000,000 QU
 
-**Validation:** `newValue` must be > 0.
+**Validation:** `newValue` must be one of the allowlisted values — `100100`, `250100`, `420000`, or
+`676420` (default `100100`). Off-allowlist values are rejected. The allowlist prevents settings that
+mechanically break the Dagger (too low) or render it permanently inactive (too high).
 
 **Format string:**
 ```
@@ -838,7 +842,7 @@ Returns all governable parameters in a single call. No input required.
 
 | Field | Type | Description |
 |---|---|---|
-| `minProfitQu` | sint64 | Minimum QU profit before a trade executes |
+| `minProfitQu` | sint64 | Minimum NET QU profit per arb, after the Qswap swap fee |
 | `proposalFeeDefault` | sint64 | Default proposal submission fee (most types) |
 | `proposalFeeAddPool` | sint64 | Fee for ADD_POOL proposals |
 | `proposalFeePayoutStructure` | sint64 | Fee for UPDATE_PAYOUT proposals |
