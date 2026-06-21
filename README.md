@@ -147,24 +147,22 @@ from it.
 | **Execution fees** | Funds on-chain execution costs |
 | **Qearn boost** | Donated to the Qearn bonus pool — raises locking rewards for the whole Qubic community |
 | **Shareholders** | Direct epoch dividend to governance token holders |
-| **Burn** | Deflationary supply reduction (currently set to 0% in all presets) |
 | **Dev fund** | Protocol development reserve (shareholder-controlled withdrawal) |
 | **CCF** | Qubic Computor Controlled Fund contribution |
 
 ### The payout presets
 
-| Preset | Trading pool | Exec fees | Qearn boost | Shareholders | Burn | Dev fund | CCF |
-|---|---|---|---|---|---|---|---|
-| **0 — Default** | 55% | 30% | 3% | 10% | 0% | 1% | 1% |
-| **1 — Growth** | 61% | 27% | 3% | 7% | 0% | 1% | 1% |
-| **2 — Aggressive** | 65% | 25% | 3% | 5% | 0% | 1% | 1% |
-| **3 — Recovery** | 0% | 100% | 0% | 0% | 0% | 0% | 0% |
+| Preset | Trading pool | Exec fees | Qearn boost | Shareholders | Dev fund | CCF |
+|---|---|---|---|---|---|---|
+| **0 — Default** | 55% | 30% | 3% | 10% | 1% | 1% |
+| **1 — Growth** | 61% | 27% | 3% | 7% | 1% | 1% |
+| **2 — Aggressive** | 65% | 25% | 3% | 5% | 1% | 1% |
+| **3 — Recovery** | 0% | 100% | 0% | 0% | 0% | 0% |
 
 Preset 0 pays shareholders the most (10%) and funds execution moderately. Presets 1 and 2
 progressively steer more toward the trading pool and execution-fee funding, with a smaller
 shareholder dividend (7% → 5%). The Qearn boost (3%), dev fund (1%), and CCF (1%) are constant
-across presets 0–2, and trading profit is no longer burned (burns still occur via vault fees on
-withdrawal). Shareholders vote to change the active preset.
+across presets 0–2. Shareholders vote to change the active preset.
 
 **Preset 3 — Recovery / limp mode** is special: the contract **keeps trading normally** but routes
 **100% of its profit** into the execution-fee reserve, suspending the shareholder, Qearn, dev-fund, and
@@ -192,7 +190,7 @@ The depositor veto exists specifically so that large depositors cannot be harmed
 decisions without a meaningful check. Veto votes are re-validated at epoch end against the
 current NAV — a depositor who has lost significant value no longer qualifies.
 
-### Governable parameters (22 proposal types)
+### Governable parameters (23 proposal types)
 
 | # | Proposal | Fee | What it changes |
 |---|---|---|---|
@@ -218,6 +216,7 @@ current NAV — a depositor who has lost significant value no longer qualifies.
 | 20 | **UPDATE_VIX_PULSE_RATE** | 50M QU | How many times a day the Dagger samples each pool's price to update its volatility reading. Options: **1 (default)**, 2, or 3 per day. More = sharper/faster detection but more fee cost; fewer = cheaper but slower to notice a token heating up. The 5-day/4-week volatility horizons stay fixed regardless — only the sampling frequency changes. |
 | 21 | **UPDATE_SWING_SELL_PCT** | 50M QU | The Cloak's sell chunk — what % of a held bag it sells each time the +12% profit trigger fires. Options: 10, 15, 20, 25, 33, **50 (default)**. Higher = takes profit faster; lower = rides winners longer. |
 | 22 | **UPDATE_BREAKOUT_RESCAN** | 50M QU | How often the Dagger re-checks a hot (breaking-out) pool while it looks for a gap (it still trades every tick once a real gap is found — this only paces the empty looks). Submitted in seconds: 30, 60, 120, 180, 240, **300 (default = 5 min)**. Shorter = catches fast gaps but costs more; longer = cheaper. |
+| 23 | **UPDATE_QX_FEE_MODE** | 50M QU | How the contract sources QX's share-transfer fee for its sell orders. **0 (default)** = use a per-epoch cached value (cheapest; QX's fee is a fixed 100 QU today). **1** = fetch the fee live from QX before every sell. A forward-looking switch: if QX ever changes its fee model so the fee can move tick-to-tick, shareholders flip this to 1 — no contract re-deploy needed. |
 
 **What happens to the fee:** every proposal fee funds the contract's **execution-fee reserve** — none is burned from supply, and none is kept as trading capital.
 
