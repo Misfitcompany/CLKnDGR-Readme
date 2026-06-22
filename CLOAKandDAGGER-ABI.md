@@ -720,9 +720,15 @@ tick-to-tick, shareholders set this to **1** and the Cloak + Dagger sell legs fe
 each sell — **no contract re-deploy required**. Until then, leave it at **0**. A stale cache is harmless
 either way: if it were ever too low, the sell simply doesn't execute (no loss); too high, a few QU overpaid.
 
+It is a **one-way latch**: enabling live mode is **permanent**. Once `qxFeeLivePerTrade` is 1, no further
+type-23 proposal is accepted — it can never be switched back to the per-epoch cache. (Rationale: you'd only
+go live because QX made its fee variable, after which the stale cache would be wrong, so reverting is never
+desirable.)
+
 **Fee:** 50,000,000 QU
 
-**Validation:** `newValue` must be 0 or 1.
+**Validation:** `newValue` must be **1** (enable), and only while still in cache mode (`qxFeeLivePerTrade == 0`).
+A value of 0, any out-of-range value, or any type-23 proposal submitted once already live, is rejected.
 
 | newValue | QX fee source |
 |---|---|
@@ -732,6 +738,68 @@ either way: if it were ever too low, the sell simply doesn't execute (no loss); 
 **Format string:**
 ```
 "23uint8, 0uint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid, 0uint64, <newValue>sint64, 0sint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid"
+```
+
+---
+
+#### Type 24 — UPDATE_STOP_LOSS_TRIGGER
+
+Sets the Cloak's **stop-loss depth** — how far a held swing bag must fall **below its average cost per
+token** before the contract begins cutting it. This is the downside counterpart to the +12% gain exit:
+without it, a bag the Cloak bought into is only ever added to (on further dips) or sold for a gain, so a
+dead asset would be held forever, dragging NAV. **0 disables the stop-loss entirely.**
+
+When a held bag's live Qswap price is at or below `avgCost × (100 − stopLossTriggerPct)%`, the contract
+sells `stopLossSellPct` (Type 25) of it **on Qswap** at the next monthly Cloak check. Of the QU recovered,
+a hardcoded **90% stays as trading capital** (→ depositor NAV) and **10% is burned to the execution-fee
+reserve** — keeping the engine funded exactly when losses have starved its normal profit-funded top-up.
+Nothing goes to shareholders / Qearn / CCF: a realized loss has no profit to distribute.
+
+**Fee:** 50,000,000 QU
+
+**Validation:** `newValue` must be **0** (disable) or a 15-point step: 15, 30, 45, 60, 75, 90.
+
+| newValue | Cuts when the bag is… |
+|---|---|
+| 0 | (stop-loss disabled) |
+| 15 | 15% below average cost |
+| 30 | 30% below |
+| 45 (default) | 45% below |
+| 60 | 60% below |
+| 75 | 75% below |
+| 90 | 90% below |
+
+**Format string:**
+```
+"24uint8, 0uint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid, 0uint64, <newValue>sint64, 0sint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid"
+```
+
+---
+
+#### Type 25 — UPDATE_STOP_LOSS_SELL
+
+Sets how much of a losing bag the stop-loss sells **each time it triggers**. It scales out rather than
+dumping the whole position at once: at the Cloak's ~monthly cadence a dying bag bleeds down over a few
+successive cuts, while one that recovers keeps whatever was not yet sold. Paired with the trigger depth
+(Type 24) and the hardcoded 90/10 capital/exec-fee split of the proceeds.
+
+**Fee:** 50,000,000 QU
+
+**Validation:** `newValue` must be a 15-point step: 15, 30, 45, 60, 75, 90. (0 is **not** valid here — disable
+the stop-loss via Type 24 instead.)
+
+| newValue | Sells per trigger |
+|---|---|
+| 15 | 15% of the bag |
+| 30 | 30% |
+| 45 | 45% |
+| 60 (default) | 60% |
+| 75 | 75% |
+| 90 | 90% |
+
+**Format string:**
+```
+"25uint8, 0uint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid, 0uint64, <newValue>sint64, 0sint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid"
 ```
 
 ---
@@ -858,8 +926,10 @@ Returns all governable parameters in a single call. No input required.
 | `vixAbsFloorBps` | sint64 | Minimum absolute recent volatility (basis points) for a breakout to count |
 | `vixSampleInterval` | uint32 | Ticks between VIX price samples (345600 = 1/day, 172800 = 2/day, 115200 = 3/day) |
 | `swingSellPct` | sint64 | Cloak sell chunk: % of a held bag sold each time the +12% trigger fires |
+| `stopLossTriggerPct` | sint64 | Cloak stop-loss depth: cut a held bag once its price is this % below average cost (0 = disabled) |
+| `stopLossSellPct` | sint64 | Cloak stop-loss: % of a losing bag sold each time the stop-loss triggers |
 | `breakoutRescanTicks` | uint32 | Dagger hot re-scan pace in ticks (÷4 = seconds) while a pool is breaking out |
-| `qxFeeLivePerTrade` | uint8 | QX-fee source: 0 = per-epoch cached fee (default); 1 = fetch the QX fee live before each sell |
+| `qxFeeLivePerTrade` | uint8 | QX-fee source: 0 = per-epoch cached fee (default); 1 = fetch live before each sell. One-way latch — once 1, permanent |
 
 ---
 

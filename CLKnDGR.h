@@ -141,6 +141,13 @@ struct CLKnDGR : public ContractBase
     static constexpr uint64 SWING_ASK_DISCOUNT_PCT       = 10;     // ask placed 10% below pool price for guaranteed fill
     static constexpr uint64 SWING_BUY_SLIPPAGE_PCT       = 5;      // accept up to 5% slippage on Qswap buy
 
+    // Cloak stop-loss (downside exit for a losing bag). Sells on Qswap (AMM always fills + returns QU
+    // in-tick, so the salvage is split immediately); proceeds split is HARDCODED 90/10 by design.
+    static constexpr uint64 STOP_LOSS_CAPITAL_PCT        = 90;     // % of loss-sale proceeds kept as trading capital (→ depositor NAV); implicit remainder, documented for clarity
+    static constexpr uint64 STOP_LOSS_EXEC_PCT           = 10;     // % of loss-sale proceeds burned to the execution-fee reserve (keeps the engine funded exactly when losses starve the normal profit-funded top-up)
+    static constexpr uint64 INITIAL_STOP_LOSS_TRIGGER_PCT = 45;    // default: cut once a bag is >= 45% below average cost; 0 = disabled; governable in 15-point steps via PROP_TYPE_UPDATE_STOP_LOSS_TRIGGER
+    static constexpr uint64 INITIAL_STOP_LOSS_SELL_PCT    = 60;    // default: sell 60% of the bag per stop-loss trigger (scale out, never dump all at once); governable in 15-point steps via PROP_TYPE_UPDATE_STOP_LOSS_SELL
+
     // ---------------------------------------------------------------
     // VIX — volatility-gated Dagger constants
     // ---------------------------------------------------------------
@@ -180,7 +187,9 @@ struct CLKnDGR : public ContractBase
     static constexpr uint8 PROP_TYPE_UPDATE_VIX_PULSE_RATE    = 20; // update vixSampleInterval (VIX pulses per day); newValue = 1,2,3 (default 1)
     static constexpr uint8 PROP_TYPE_UPDATE_SWING_SELL_PCT    = 21; // update swingSellPct (Cloak sell chunk %); newValue = 10,15,20,25,33,50 (default 50)
     static constexpr uint8 PROP_TYPE_UPDATE_BREAKOUT_RESCAN   = 22; // update breakoutRescanTicks (Dagger hot re-scan pace); newValue = 30,60,120,180,240,300 seconds (default 300)
-    static constexpr uint8 PROP_TYPE_UPDATE_QX_FEE_MODE       = 23; // update qxFeeLivePerTrade (QX transfer-fee freshness); newValue = 0 (per-epoch cache, default) or 1 (fetch QX fee live before each sell — future-proof if QX ever makes its fee tick-variable)
+    static constexpr uint8 PROP_TYPE_UPDATE_QX_FEE_MODE       = 23; // ONE-WAY latch: enable live QX-fee mode (newValue must be 1); flips qxFeeLivePerTrade 0->1 PERMANENTLY. Once live it can never revert to the per-epoch cache (future-proof if QX ever makes its fee tick-variable)
+    static constexpr uint8 PROP_TYPE_UPDATE_STOP_LOSS_TRIGGER = 24; // update stopLossTriggerPct (Cloak deep-loser cut threshold, % below avg cost); newValue = 0(off),15,30,45,60,75,90 (default 45)
+    static constexpr uint8 PROP_TYPE_UPDATE_STOP_LOSS_SELL    = 25; // update stopLossSellPct (% of a losing bag sold per stop-loss trigger); newValue = 15,30,45,60,75,90 (default 60)
 
     // ---------------------------------------------------------------
     // Direct action constants
@@ -271,6 +280,8 @@ struct CLKnDGR : public ContractBase
         sint64 vixAbsFloorBps;     // VIX absolute floor in basis points
         uint32 vixSampleInterval;  // ticks between VIX pulses (345600=1/day, 172800=2/day, 115200=3/day)
         sint64 swingSellPct;       // Cloak sell chunk % per +12% trigger
+        sint64 stopLossTriggerPct; // Cloak stop-loss cut threshold (% below avg cost; 0 = disabled)
+        sint64 stopLossSellPct;    // Cloak stop-loss: % of a losing bag sold per trigger
         uint32 breakoutRescanTicks;// Dagger breakout re-scan pace (ticks; ÷4 = seconds)
         uint8  qxFeeLivePerTrade;  // 0 = use cached QX fee (default), 1 = fetch QX fee live before each sell
     };
@@ -515,6 +526,13 @@ struct CLKnDGR : public ContractBase
         QX::AddToAskOrder_output swingAskOut;
         QX::Fees_input  swingFeesIn;    // only used when qxFeeLivePerTrade==1 (live QX-fee fetch per sell)
         QX::Fees_output swingFeesOut;
+        // Cloak stop-loss locals (downside exit; reuses qaIn/qaOut + swapAssetIn/swapAssetOut + tradeAsset)
+        sint64 stopTriggerPrice; // avg cost × (100 - stopLossTriggerPct)% — cut at/below this pool price
+        sint64 stopSellAmt;      // tokens cut on this trigger
+        sint64 stopExecSlice;    // STOP_LOSS_EXEC_PCT of proceeds → qpi.burn (execution-fee reserve)
+        sint64 stopMovedCost;    // proportional cost basis of the cut/parked tokens
+        sint64 stopNewTokens;    // remaining bag after the cut
+        sint64 stopNewCost;      // remaining cost basis after the cut
         uint32          effectiveQxFee; // QX transfer fee actually passed to releaseShares (cache, or live if toggled)
         Asset   swingAsset;
         sint64  swingPoolPrice;
@@ -720,6 +738,8 @@ struct CLKnDGR : public ContractBase
         sint64 vixAbsFloorBps;     // min fast vol (bps) to count as a breakout; governable via PROP_TYPE_UPDATE_VIX_FLOOR
         uint32 vixSampleInterval;  // ticks between VIX pulses (345600=1/day default, 172800=2/day, 115200=3/day); governable via PROP_TYPE_UPDATE_VIX_PULSE_RATE
         sint64 swingSellPct;       // Cloak: % of a swing bag sold per +12% trigger; default 50; governable via PROP_TYPE_UPDATE_SWING_SELL_PCT
+        sint64 stopLossTriggerPct; // Cloak stop-loss: cut a bag once pool price <= avg cost × (100 - this)%; default 45; 0 = disabled; governable via PROP_TYPE_UPDATE_STOP_LOSS_TRIGGER
+        sint64 stopLossSellPct;    // Cloak stop-loss: % of the losing bag sold per trigger; default 60; governable via PROP_TYPE_UPDATE_STOP_LOSS_SELL
         uint32 breakoutRescanTicks;// Dagger: re-scan pace (ticks) while a pool is in a VIX breakout; default 1200 (5 min); governable via PROP_TYPE_UPDATE_BREAKOUT_RESCAN
         uint32 qxTransferFee;      // cached QX share-transfer fee (QU). Bootstrapped to QX's constant (100 since
                                    // epoch 138) and refreshed live whenever the reserve-liquidation path queries
@@ -777,6 +797,8 @@ struct CLKnDGR : public ContractBase
         state.mut().vixAbsFloorBps         = INITIAL_VIX_ABS_FLOOR_BPS;  // 25 bps; governable via PROP_TYPE_UPDATE_VIX_FLOOR
         state.mut().vixSampleInterval      = INITIAL_VIX_SAMPLE_INTERVAL; // 1 pulse/day; governable via PROP_TYPE_UPDATE_VIX_PULSE_RATE
         state.mut().swingSellPct           = INITIAL_SWING_SELL_PCT;     // 50%; governable via PROP_TYPE_UPDATE_SWING_SELL_PCT
+        state.mut().stopLossTriggerPct     = INITIAL_STOP_LOSS_TRIGGER_PCT; // 45% below avg cost; 0 disables; governable via PROP_TYPE_UPDATE_STOP_LOSS_TRIGGER
+        state.mut().stopLossSellPct        = INITIAL_STOP_LOSS_SELL_PCT;    // sell 60% of the bag per trigger; governable via PROP_TYPE_UPDATE_STOP_LOSS_SELL
         state.mut().breakoutRescanTicks    = COOLDOWN_TICKS_BREAKOUT;    // 1200 ticks (5 min); governable via PROP_TYPE_UPDATE_BREAKOUT_RESCAN
         state.mut().qxTransferFee          = INITIAL_QX_TRANSFER_FEE;    // 100 QU bootstrap; refreshed live from QX during reserve liquidation
     }
@@ -1247,6 +1269,14 @@ struct CLKnDGR : public ContractBase
                         if (locals.addAskOut.addedNumberOfShares > 0)
                         {
                             locals.sellProceeds = (sint64)((uint64)locals.addAskOut.addedNumberOfShares * (uint64)locals.bidOut.orders.get(0).price);
+                            // Book NET of QX's trade fee: QX skims it from the seller's proceeds (Qx.h:646),
+                            // so booking the gross would over-distribute reserveSellProceeds. Mirror QX's
+                            // formula: fee = proceeds*tradeFee/1e9 + 1 (tradeFee is in billionths; feesOut was
+                            // fetched just above for the transfer fee). Reserve sells stay well below the
+                            // overflow threshold QX guards at, so the single-step form is exact here.
+                            locals.sellProceeds = locals.sellProceeds
+                                - ((sint64)div((uint64)locals.sellProceeds * (uint64)locals.feesOut.tradeFee, 1000000000ULL) + 1);
+                            if (locals.sellProceeds < 0) { locals.sellProceeds = 0; }
                             state.mut().reserveSellProceeds = state.get().reserveSellProceeds + locals.sellProceeds;
                             state.mut().totalProfitEarned   = state.get().totalProfitEarned   + locals.sellProceeds;
                         }
@@ -1646,9 +1676,28 @@ struct CLKnDGR : public ContractBase
                 }
                 else if (locals.prop.proposalType == PROP_TYPE_UPDATE_QX_FEE_MODE)
                 {
-                    if (locals.prop.newValue == 0LL || locals.prop.newValue == 1LL)
+                    // One-way latch: a passed type-23 proposal only ever ENABLES live mode (validation
+                    // guarantees newValue==1 and that we were still in cache mode). Set, never clear —
+                    // once live, it stays live permanently.
+                    state.mut().qxFeeLivePerTrade = 1;
+                }
+                else if (locals.prop.proposalType == PROP_TYPE_UPDATE_STOP_LOSS_TRIGGER)
+                {
+                    // 0 = disable the stop-loss; otherwise a 15-point step in [15,90].
+                    if (locals.prop.newValue == 0LL  || locals.prop.newValue == 15LL || locals.prop.newValue == 30LL ||
+                        locals.prop.newValue == 45LL || locals.prop.newValue == 60LL || locals.prop.newValue == 75LL ||
+                        locals.prop.newValue == 90LL)
                     {
-                        state.mut().qxFeeLivePerTrade = (uint8)locals.prop.newValue;
+                        state.mut().stopLossTriggerPct = locals.prop.newValue;
+                    }
+                }
+                else if (locals.prop.proposalType == PROP_TYPE_UPDATE_STOP_LOSS_SELL)
+                {
+                    // A 15-point step in [15,90] (how much of the bag to cut per trigger).
+                    if (locals.prop.newValue == 15LL || locals.prop.newValue == 30LL || locals.prop.newValue == 45LL ||
+                        locals.prop.newValue == 60LL || locals.prop.newValue == 75LL || locals.prop.newValue == 90LL)
+                    {
+                        state.mut().stopLossSellPct = locals.prop.newValue;
                     }
                 }
                 else if (locals.prop.proposalType == PROP_TYPE_WITHDRAW_ASSET_RESERVE)
@@ -1953,8 +2002,9 @@ struct CLKnDGR : public ContractBase
         // ==============================================================
 
         // --- Cloak recovery pass: retry TSRM for swing positions where rights transfer failed ---
-        // source=0: ENTRY path — tokens stuck under Qswap after a buy TSRM failure.
-        //           On success: returned to swingTokens (restore swing position).
+        // source=0: ENTRY path — tokens stuck under Qswap after a buy TSRM failure, OR a stop-loss
+        //           sell whose Qswap swap reverted (degenerate pool). On success: returned to
+        //           swingTokens (restore the position; a stop-loss just retries next monthly check).
         // source=2: EXIT path — tokens stuck under QX after AddToAskOrder placed 0 shares
         //           AND the inline QX TSRM also failed. On success: folded into poolReserve.
         for (locals.i = 0; locals.i < (uint64)state.get().poolCount; locals.i = locals.i + 1)
@@ -2286,6 +2336,112 @@ struct CLKnDGR : public ContractBase
                     // Sold (or attempted) this check — done; skip the buy section below.
                     continue;
                 }
+
+                // ==========================================================
+                // STOP-LOSS: cut a deep loser (downside exit)
+                // ==========================================================
+                // The +12% gain trigger above didn't fire. If this bag has instead fallen to avg cost ×
+                // (100 - stopLossTriggerPct)% or below, liquidate stopLossSellPct% of it on Qswap. Qswap
+                // (the AMM) always fills and returns the QU in-tick, so we split the salvage immediately:
+                // STOP_LOSS_EXEC_PCT (10%) is burned to the execution-fee reserve and the remaining ~90%
+                // stays in contractBalance as trading capital (-> depositor NAV). No epochProfit booking —
+                // this is a realized LOSS; it flows through the quBalance/NAV delta like every other swing
+                // flow, paying nothing to shareholders/Qearn/CCF (there is no profit on a loss).
+                // stopLossTriggerPct == 0 disables the stop-loss entirely (governable, 15-point steps).
+                if (state.get().stopLossTriggerPct > 0)
+                {
+                    // triggerPrice = costPerToken × (100 - trigger)/100. Subtractive form (× trigger)
+                    // avoids the × (100 - trigger) overflow class (same as the EC-3 family).
+                    locals.stopTriggerPrice = locals.swingCostPerToken -
+                        (sint64)div((uint64)locals.swingCostPerToken * (uint64)state.get().stopLossTriggerPct, (uint64)100);
+                    if (locals.stopTriggerPrice > 0 && locals.swingPoolPrice <= locals.stopTriggerPrice)
+                    {
+                        // Cut size: stopLossSellPct% of the bag (floor 1; never exceed the bag).
+                        locals.stopSellAmt = (sint64)div(
+                            (uint64)state.get().swingTokens.get(locals.i) * (uint64)state.get().stopLossSellPct, (uint64)100);
+                        if (locals.stopSellAmt <= 0) { locals.stopSellAmt = 1; }
+                        if (locals.stopSellAmt > state.get().swingTokens.get(locals.i))
+                        {
+                            locals.stopSellAmt = state.get().swingTokens.get(locals.i);
+                        }
+
+                        // Quote the sale (prices the real AMM impact at this size). Fee guard: if the
+                        // proceeds wouldn't even clear the 100K Qswap fee, the bag is too dead to bother —
+                        // leave it and revisit next monthly check rather than burn the fee for nothing.
+                        locals.qaIn.assetIssuer   = state.get().poolIssuers.get(locals.i);
+                        locals.qaIn.assetName     = state.get().poolAssetNames.get(locals.i);
+                        locals.qaIn.assetAmountIn = locals.stopSellAmt;
+                        { CALL_OTHER_CONTRACT_FUNCTION(QSWAP, QuoteExactAssetInput, locals.qaIn, locals.qaOut); }
+                        if (locals.qaOut.quAmountOut <= (sint64)QSWAP_ADDITIONAL_FEE) { continue; }
+
+                        // Proportional cost basis of the cut tokens, and the bag remaining after the cut
+                        // (divide-first; overflow-safe — same form as the reserve / gain-exit paths).
+                        locals.stopMovedCost = (state.get().swingTokens.get(locals.i) > 0)
+                            ? (sint64)(div((uint64)state.get().swingCostBasis.get(locals.i),
+                                           (uint64)state.get().swingTokens.get(locals.i)) * (uint64)locals.stopSellAmt)
+                            : 0;
+                        locals.stopNewTokens = state.get().swingTokens.get(locals.i) - locals.stopSellAmt;
+                        if (locals.stopNewTokens < 0) { locals.stopNewTokens = 0; }
+                        locals.stopNewCost = (locals.stopNewTokens > 0 && state.get().swingTokens.get(locals.i) > 0)
+                            ? (sint64)(div((uint64)state.get().swingCostBasis.get(locals.i),
+                                           (uint64)state.get().swingTokens.get(locals.i)) * (uint64)locals.stopNewTokens)
+                            : 0;
+
+                        // Give Qswap managing rights (fee 0 → success returns 0; check < 0 for failure).
+                        locals.tradeAsset.issuer    = state.get().poolIssuers.get(locals.i);
+                        locals.tradeAsset.assetName = state.get().poolAssetNames.get(locals.i);
+                        locals.transferResult = qpi.releaseShares(
+                            locals.tradeAsset, SELF, SELF, locals.stopSellAmt,
+                            QSWAP_CONTRACT_INDEX, QSWAP_CONTRACT_INDEX, 0);
+                        if (locals.transferResult < 0)
+                        {
+                            // Rights transfer rejected — nothing released, tokens still under CLKnDGR.
+                            // Park them (with cost) in the pool reserve for later liquidation; drop from bag.
+                            state.mut().poolReserveTokens.set(locals.i,    state.get().poolReserveTokens.get(locals.i)    + locals.stopSellAmt);
+                            state.mut().poolReserveCostBasis.set(locals.i, state.get().poolReserveCostBasis.get(locals.i) + locals.stopMovedCost);
+                            state.mut().swingTokens.set(locals.i,    locals.stopNewTokens);
+                            state.mut().swingCostBasis.set(locals.i, locals.stopNewCost);
+                            continue;
+                        }
+
+                        // Sell on Qswap. Floor at quote - 10% (atomic fill-vs-quote guard; a catastrophic
+                        // fill reverts → recovered next tick instead of dumped). Fee paid as the reward.
+                        locals.swapAssetIn.assetIssuer    = state.get().poolIssuers.get(locals.i);
+                        locals.swapAssetIn.assetName      = state.get().poolAssetNames.get(locals.i);
+                        locals.swapAssetIn.assetAmountIn  = locals.stopSellAmt;
+                        locals.swapAssetIn.quAmountOutMin = locals.qaOut.quAmountOut
+                            - (sint64)div((uint64)locals.qaOut.quAmountOut, (uint64)10);
+                        { INVOKE_OTHER_CONTRACT_PROCEDURE(QSWAP, SwapExactAssetForQu, locals.swapAssetIn, locals.swapAssetOut, QSWAP_ADDITIONAL_FEE); }
+
+                        if (locals.swapAssetOut.quAmountOut <= 0)
+                        {
+                            // Swap reverted (degenerate pool only — the quote was taken atomically). Tokens
+                            // are under Qswap rights now; schedule Cloak Qswap-TSRM recovery (source 0) and
+                            // drop them from the bag. The recovery pass restores them next tick, so the
+                            // stop-loss simply retries at the following monthly check. (swingPendingRecoveryAmt
+                            // is 0 here — the main loop skips this pool while a recovery is pending.)
+                            state.mut().swingPendingRecoveryAmt.set(locals.i,    locals.stopSellAmt);
+                            state.mut().swingPendingRecoveryCost.set(locals.i,   locals.stopMovedCost);
+                            state.mut().swingPendingRecoverySource.set(locals.i, 0); // 0 = Qswap (restored to bag on recovery)
+                            state.mut().swingTokens.set(locals.i,    locals.stopNewTokens);
+                            state.mut().swingCostBasis.set(locals.i, locals.stopNewCost);
+                            continue;
+                        }
+
+                        // Success. Salvage split: burn STOP_LOSS_EXEC_PCT (10%) of the proceeds to the
+                        // execution-fee reserve; the remaining ~90% stays in contractBalance as trading
+                        // capital. No epochProfit (realized loss — NAV absorbs it via the quBalance delta).
+                        locals.stopExecSlice = (sint64)div(
+                            (uint64)locals.swapAssetOut.quAmountOut * (uint64)STOP_LOSS_EXEC_PCT, (uint64)100);
+                        if (locals.stopExecSlice > 0) { qpi.burn(locals.stopExecSlice); }
+
+                        // Shrink the bag by the amount sold.
+                        state.mut().swingTokens.set(locals.i,    locals.stopNewTokens);
+                        state.mut().swingCostBasis.set(locals.i, locals.stopNewCost);
+                        state.mut().totalArbsExecuted = state.get().totalArbsExecuted + 1;
+                        continue;
+                    }
+                }
                 // Sell trigger not met: consider a DCA-in ADD on a continued dip, but only while this
                 // token's cost basis is under the per-token cap (MAX_SWING_POSITION_PCT of capital).
                 // The cap re-opens as trading capital grows or as the position is sold down.
@@ -2546,6 +2702,14 @@ struct CLKnDGR : public ContractBase
                 { INVOKE_OTHER_CONTRACT_PROCEDURE(QX, AddToBidOrder, locals.addBidIn, locals.addBidOut, locals.quCostOnQx); }
 
                 if (locals.addBidOut.addedNumberOfShares <= 0) { continue; }
+
+                // INVARIANT (do not break): QX's addedNumberOfShares is the ACCEPTED size, not the FILLED
+                // size (Qx.h:742) — an unfilled bid would REST with QU escrowed and no shares received. We
+                // rely on it equaling the filled size, which holds because (a) we priced the bid AT the best
+                // ask and capped it to that ask's size (above), and (b) BEGIN_TICK is atomic, so the ask we
+                // read cannot move before this bid — the bid crosses exactly that ask and fully fills. If a
+                // future change ever bids above or beyond the read top-of-book, this breaks and CLKnDGR would
+                // treat escrowed-but-unfilled QU as owned shares (there is no order-cancel path).
 
                 // Deduct actual QU spent from tradingBalance so later pools in this tick
                 // see the real remaining capital, not the stale tick-start snapshot.
@@ -2865,16 +3029,11 @@ struct CLKnDGR : public ContractBase
                 locals.swingAskIn.numberOfShares = locals.daSellAmt;
                 { INVOKE_OTHER_CONTRACT_PROCEDURE(QX, AddToAskOrder, locals.swingAskIn, locals.swingAskOut, 0); }
 
-                // Any shares QX did not match are stuck under QX management with no reclaimable order.
-                // (Normally zero, since we priced at the bid and capped to bid size.) Route the unmatched
-                // remainder to recovery (source 2); the matched portion's QU lands next tick (deferred).
-                if (locals.swingAskOut.addedNumberOfShares < locals.daSellAmt)
-                {
-                    locals.daSellAmt = (locals.swingAskOut.addedNumberOfShares > 0) ? locals.swingAskOut.addedNumberOfShares : 0;
-                    state.mut().poolPendingRecoveryAmt.set(locals.i,       (locals.daTotalTokens - locals.daReserveAmt) - locals.daSellAmt);
-                    state.mut().poolPendingRecoverySource.set(locals.i,    2); // stuck under QX
-                    state.mut().poolPendingRecoveryCostBasis.set(locals.i, (sint64)((uint64)locals.daCostPerToken * (uint64)((locals.daTotalTokens - locals.daReserveAmt) - locals.daSellAmt)));
-                }
+                // No partial-fill recovery is needed here: QX's addedNumberOfShares is the ACCEPTED size,
+                // not the filled size (Qx.h:564), so a `< daSellAmt` test could never fire. And by
+                // construction the ask fully matches — it is priced AT the QX bid and daSellAmt was capped to
+                // that bid's size, and BEGIN_TICK is atomic so the bid we read cannot move before this ask.
+                // (The matched QU lands next tick — deferred profit, counted below.)
 
                 // Reserve portion never left CLKnDGR management — fold it in (cost = per-token Qswap cost).
                 if (locals.daReserveAmt > 0)
@@ -2945,7 +3104,7 @@ struct CLKnDGR : public ContractBase
 
         // Validate proposal type — full refund on rejection (mirrors the insufficient-fee path below).
         if (input.proposalType < PROP_TYPE_ADD_POOL ||
-            input.proposalType > PROP_TYPE_UPDATE_QX_FEE_MODE)
+            input.proposalType > PROP_TYPE_UPDATE_STOP_LOSS_SELL)
         {
             if (qpi.invocationReward() > 0) { qpi.transfer(qpi.invocator(), qpi.invocationReward()); }
             return;
@@ -3119,8 +3278,23 @@ struct CLKnDGR : public ContractBase
         }
         if (locals.contentValid && input.proposalType == PROP_TYPE_UPDATE_QX_FEE_MODE)
         {
-            // QX transfer-fee freshness: 0 = per-epoch cache (default), 1 = live fetch before each sell.
-            if (input.newValue != 0LL && input.newValue != 1LL) { locals.contentValid = 0; }
+            // One-way latch: type 23 can ONLY enable live mode (newValue must be 1), and only while still
+            // in cache mode. Once live (qxFeeLivePerTrade == 1) the switch is permanent — any further
+            // type-23 proposal is rejected, so it can never be turned back to the per-epoch cache.
+            if (input.newValue != 1LL || state.get().qxFeeLivePerTrade != 0) { locals.contentValid = 0; }
+        }
+        if (locals.contentValid && input.proposalType == PROP_TYPE_UPDATE_STOP_LOSS_TRIGGER)
+        {
+            // Cloak stop-loss cut threshold (% below avg cost). 0 disables; else a 15-point step, 15..90.
+            if (input.newValue != 0LL  && input.newValue != 15LL && input.newValue != 30LL &&
+                input.newValue != 45LL && input.newValue != 60LL && input.newValue != 75LL &&
+                input.newValue != 90LL) { locals.contentValid = 0; }
+        }
+        if (locals.contentValid && input.proposalType == PROP_TYPE_UPDATE_STOP_LOSS_SELL)
+        {
+            // % of a losing bag sold per stop-loss trigger: a 15-point step, 15..90.
+            if (input.newValue != 15LL && input.newValue != 30LL && input.newValue != 45LL &&
+                input.newValue != 60LL && input.newValue != 75LL && input.newValue != 90LL) { locals.contentValid = 0; }
         }
 
         // Reject duplicate proposals: prevent two conflicting proposals of the same type in one epoch.
@@ -3345,6 +3519,8 @@ struct CLKnDGR : public ContractBase
         output.vixAbsFloorBps             = state.get().vixAbsFloorBps;
         output.vixSampleInterval          = state.get().vixSampleInterval;
         output.swingSellPct               = state.get().swingSellPct;
+        output.stopLossTriggerPct         = state.get().stopLossTriggerPct;
+        output.stopLossSellPct            = state.get().stopLossSellPct;
         output.breakoutRescanTicks        = state.get().breakoutRescanTicks;
         output.qxFeeLivePerTrade          = state.get().qxFeeLivePerTrade;
         output.inLimpMode                 = state.get().inLimpMode;

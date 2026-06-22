@@ -232,6 +232,664 @@ public:
 };
 
 // ===============================================================
+// DEX integration fixture: CLKnDGR + real QX + real Qswap
+// ---------------------------------------------------------------
+// The trade engine (Cloak + Dagger) reaches QX(1) and Qswap(13) through
+// CALL_OTHER_CONTRACT_FUNCTION / INVOKE_OTHER_CONTRACT_PROCEDURE. To exercise
+// those live paths we INIT the REAL QX and Qswap contracts alongside CLKnDGR(29)
+// and seed a genuine market: issue an asset on Qswap, create + fund a pool (which
+// sets the AMM price), optionally move some shares' management to QX so a maker can
+// post an ask, and post QX bid/ask orders as counterparties. CLKnDGR then trades
+// against the real DEX logic — no mocks, so the math the tests verify is the same
+// math that runs on mainnet.
+//
+// Asset management lives per-share: the asset is issued under Qswap management (so
+// the pool LP can add liquidity); for Direction B we move a slice to QX management
+// so a maker can post an ask. Inter-contract calls in the test harness are not
+// gated by callee construction epoch (qrwa/qswap tests call Qswap from epoch 0),
+// so we leave system.epoch at the base-fixture default.
+//
+// Qswap fees that Qswap.h does not expose (mirrors the contract_qswap.cpp test
+// constants). QSWAP_ADDITIONAL_FEE is provided by Qswap.h.
+// ===============================================================
+static constexpr uint64 CLK_QSWAP_ISSUE_ASSET_FEE = 1000000000ull;
+static constexpr uint64 CLK_QSWAP_CREATE_POOL_FEE  = 1000000000ull;
+
+class ContractTestingCLKnDGRDex : public ContractTestingCLKnDGR
+{
+    // system.epoch / system.tick are PROCESS-GLOBAL and shared across gtest cases. This fixture
+    // advances them (and a test may set the tick), so we snapshot on construction and restore on
+    // teardown — otherwise the elevated epoch/tick leaks into later tests (e.g. the VaultRelock
+    // tests, which assume a fresh epoch).
+    decltype(system.epoch) savedEpoch_{};
+    decltype(system.tick)  savedTick_{};
+public:
+    ContractTestingCLKnDGRDex()
+    {
+        savedEpoch_ = system.epoch;
+        savedTick_  = system.tick;
+
+        // Base ctor already ran initEmptySpectrum/Universe + INIT_CONTRACT(CLKnDGR) + INITIALIZE.
+        // Stand up the real DEXes CLKnDGR trades against.
+        INIT_CONTRACT(QX);
+        callSystemProcedure(QX_CONTRACT_INDEX, INITIALIZE);
+        INIT_CONTRACT(QSWAP);
+        callSystemProcedure(QSWAP_CONTRACT_INDEX, INITIALIZE);
+
+        // Asset management-rights transfers (qpi.releaseShares to another contract) require the
+        // managing contract to be past its construction epoch — see the contract_qswap.cpp TSRM
+        // test, which sets system.epoch before transferring rights. CLKnDGR moves rights during
+        // the arb (e.g. Direction A's sell leg), so advance to its construction epoch (999),
+        // which is past QX's and Qswap's too. Only this DEX fixture is affected.
+        system.epoch = contractDescriptions[CLKnDGR_CONTRACT_INDEX].constructionEpoch;
+    }
+
+    ~ContractTestingCLKnDGRDex()
+    {
+        system.epoch = savedEpoch_;
+        system.tick  = savedTick_;
+    }
+
+    // CLKnDGR's on-chain id; energy added here is the contract's QU trading capital.
+    static id clkSelf() { return id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0); }
+    void fundContract(sint64 qu) { increaseEnergy(clkSelf(), qu); }
+
+    // Write a pool entry straight into CLKnDGR state (bypasses the governance ADD_POOL cycle).
+    void seedPool(uint64 idx, const id& assetIssuer, uint64 assetName)
+    {
+        auto* s = st();
+        s->poolIssuers.set(idx, assetIssuer);
+        s->poolAssetNames.set(idx, assetName);
+        s->poolActive.set(idx, 1);
+        if ((uint64)s->poolCount <= idx) { s->poolCount = (uint8)(idx + 1); }
+    }
+
+    // ---- Qswap seeding ----
+    sint64 qswapIssueAsset(const id& maker, uint64 assetName, sint64 shares)
+    {
+        QSWAP::IssueAsset_input in{ assetName, shares, 0, 0 };
+        QSWAP::IssueAsset_output out{};
+        increaseEnergy(maker, CLK_QSWAP_ISSUE_ASSET_FEE);
+        invokeUserProcedure(QSWAP_CONTRACT_INDEX, 1, in, out, maker, CLK_QSWAP_ISSUE_ASSET_FEE);
+        return out.issuedNumberOfShares;
+    }
+
+    bool qswapCreatePool(const id& maker, const id& assetIssuer, uint64 assetName)
+    {
+        QSWAP::CreatePool_input in{ assetIssuer, assetName };
+        QSWAP::CreatePool_output out{};
+        increaseEnergy(maker, CLK_QSWAP_CREATE_POOL_FEE);
+        invokeUserProcedure(QSWAP_CONTRACT_INDEX, 3, in, out, maker, CLK_QSWAP_CREATE_POOL_FEE);
+        return out.success;
+    }
+
+    // First add sets the pool ratio: price = quAmount / assetAmount.
+    QSWAP::AddLiquidity_output qswapAddLiquidity(const id& maker, const id& assetIssuer, uint64 assetName,
+                                                 sint64 assetAmount, sint64 quAmount)
+    {
+        QSWAP::AddLiquidity_input in{ assetIssuer, assetName, assetAmount, 0, 0 };
+        QSWAP::AddLiquidity_output out{};
+        sint64 reward = quAmount + (sint64)QSWAP_ADDITIONAL_FEE;
+        increaseEnergy(maker, reward);
+        invokeUserProcedure(QSWAP_CONTRACT_INDEX, 4, in, out, maker, reward);
+        return out;
+    }
+
+    // Move share management Qswap -> QX so `maker` can post a QX ask for the asset.
+    sint64 qswapMgmtToQx(const id& maker, const id& assetIssuer, uint64 assetName, sint64 shares)
+    {
+        QSWAP::TransferShareManagementRights_input in{};
+        in.asset.issuer = assetIssuer;
+        in.asset.assetName = assetName;
+        in.numberOfShares = shares;
+        in.newManagingContractIndex = QX_CONTRACT_INDEX;
+        QSWAP::TransferShareManagementRights_output out{};
+        increaseEnergy(maker, 100);
+        invokeUserProcedure(QSWAP_CONTRACT_INDEX, 11, in, out, maker, 100);
+        return out.transferredNumberOfShares;
+    }
+
+    QSWAP::GetPoolBasicState_output qswapPool(const id& assetIssuer, uint64 assetName)
+    {
+        QSWAP::GetPoolBasicState_input in{ assetIssuer, assetName };
+        QSWAP::GetPoolBasicState_output out{};
+        callFunction(QSWAP_CONTRACT_INDEX, 2, in, out);
+        return out;
+    }
+
+    // ---- QX seeding ----
+    // Ask = maker offers to SELL `shares` at `price`; requires maker to possess the
+    // shares under QX management (no QU escrow). Returns added shares.
+    sint64 qxAddAsk(const id& maker, const id& assetIssuer, uint64 assetName, sint64 price, sint64 shares)
+    {
+        QX::AddToAskOrder_input in{ assetIssuer, assetName, price, shares };
+        QX::AddToAskOrder_output out{};
+        invokeUserProcedure(QX_CONTRACT_INDEX, 5, in, out, maker, 0);
+        return out.addedNumberOfShares;
+    }
+
+    // Bid = maker offers to BUY `shares` at `price`; escrows price*shares QU.
+    sint64 qxAddBid(const id& maker, const id& assetIssuer, uint64 assetName, sint64 price, sint64 shares)
+    {
+        QX::AddToBidOrder_input in{ assetIssuer, assetName, price, shares };
+        QX::AddToBidOrder_output out{};
+        sint64 escrow = price * shares;
+        increaseEnergy(maker, escrow);
+        invokeUserProcedure(QX_CONTRACT_INDEX, 6, in, out, maker, escrow);
+        return out.addedNumberOfShares;
+    }
+
+    QX::AssetBidOrders_output qxBids(const id& assetIssuer, uint64 assetName)
+    {
+        QX::AssetBidOrders_input in{ assetIssuer, assetName, 0 };
+        QX::AssetBidOrders_output out{};
+        callFunction(QX_CONTRACT_INDEX, 3, in, out);
+        return out;
+    }
+
+    QX::AssetAskOrders_output qxAsks(const id& assetIssuer, uint64 assetName)
+    {
+        QX::AssetAskOrders_input in{ assetIssuer, assetName, 0 };
+        QX::AssetAskOrders_output out{};
+        callFunction(QX_CONTRACT_INDEX, 2, in, out);
+        return out;
+    }
+};
+
+// ===============================================================
+// DAGGER — live arbitrage against real QX + Qswap
+// ===============================================================
+
+// Direction B: buy the cheap QX ask, sell into the richer Qswap pool, book profit in-tick.
+// Verifies the Qswap-fee fix — the sell leg now funds QSWAP_ADDITIONAL_FEE and books NET profit.
+TEST(ContractCLKnDGR, Dagger_DirectionB_BuyQxSellQswap_BooksProfit)
+{
+    ContractTestingCLKnDGRDex ctx;
+    const id     maker = clkUser(50);
+    const uint64 asset = assetNameFromString("CLKARB");
+
+    EXPECT_EQ(ctx.qswapIssueAsset(maker, asset, 10000000LL), 10000000LL);
+    EXPECT_TRUE(ctx.qswapCreatePool(maker, maker, asset));
+    ctx.qswapAddLiquidity(maker, maker, asset, 1000000LL, 280000000LL); // price 280
+    EXPECT_GT(ctx.qswapMgmtToQx(maker, maker, asset, 50000LL), 0LL);
+    // 2000 shares @ ask 100 vs pool ~280: gross gap clears minProfitQu + the Qswap fee (net semantics).
+    EXPECT_GT(ctx.qxAddAsk(maker, maker, asset, 100LL, 2000LL), 0LL);
+
+    ctx.seedPool(0, maker, asset);
+    ctx.fundContract(1000000LL);
+
+    auto before = ctx.getStats();
+    ctx.beginTick();
+    auto after = ctx.getStats();
+
+    EXPECT_GT(after.totalArbsExecuted, before.totalArbsExecuted); // an arb fired
+    EXPECT_GT(after.totalProfitEarned, before.totalProfitEarned); // Direction B books in-tick
+    EXPECT_GT(ctx.st()->epochProfit, 0LL);
+}
+
+// Direction A: buy the cheap Qswap pool, sell into the richer QX bid. Profit is DEFERRED
+// (QU lands a future tick); only the arb counter moves now. Verifies the Qswap-fee fix.
+TEST(ContractCLKnDGR, Dagger_DirectionA_BuyQswapSellQxBid_CountsArb)
+{
+    ContractTestingCLKnDGRDex ctx;
+    const id     maker = clkUser(50);
+    const uint64 asset = assetNameFromString("CLKARB");
+
+    // CHEAP Qswap pool: 1,000,000 asset / 100,000,000 QU -> price 100. Rich QX bid at 500.
+    EXPECT_EQ(ctx.qswapIssueAsset(maker, asset, 10000000LL), 10000000LL);
+    EXPECT_TRUE(ctx.qswapCreatePool(maker, maker, asset));
+    ctx.qswapAddLiquidity(maker, maker, asset, 1000000LL, 100000000LL);
+    // 2000 shares @ bid 500 vs pool ~100: gross gap clears minProfitQu + the Qswap fee (net semantics).
+    EXPECT_GT(ctx.qxAddBid(maker, maker, asset, 500LL, 2000LL), 0LL);
+
+    ctx.seedPool(0, maker, asset);
+    ctx.fundContract(5000000LL);
+
+    auto before = ctx.getStats();
+    ctx.beginTick();
+    auto after = ctx.getStats();
+
+    EXPECT_GT(after.totalArbsExecuted, before.totalArbsExecuted); // an arb fired
+    EXPECT_EQ(ctx.st()->epochProfit, 0LL);                        // deferred: not booked in-tick
+    EXPECT_GT(ctx.st()->poolReserveTokens.get(0), 0LL);           // RESERVE_PCT folded into reserve
+}
+
+// Direction B with a LARGE arb: gross is big enough to trip the capital-spread scale-down
+// (scaleFactor >= 2). Regression for task #50 — sizing the scale-down on the realized (90%-sold)
+// margin keeps the shrunk trade above the slippage guard, so it executes instead of reverting.
+// (Before the fix this reverted: shrunk too far, the 90% sale couldn't cover full cost + fee + margin.)
+// Deep pool so slippage is negligible and the math is clear.
+TEST(ContractCLKnDGR, Dagger_DirectionB_LargeArb_ScalesDownAndFires)
+{
+    ContractTestingCLKnDGRDex ctx;
+    const id     maker = clkUser(50);
+    const uint64 asset = assetNameFromString("CLKBIG");
+
+    // Deep pool priced ~280 (10,000,000 asset / 2,800,000,000 QU); cheap QX ask at 100, large size.
+    EXPECT_EQ(ctx.qswapIssueAsset(maker, asset, 20000000LL), 20000000LL);
+    EXPECT_TRUE(ctx.qswapCreatePool(maker, maker, asset));
+    ctx.qswapAddLiquidity(maker, maker, asset, 10000000LL, 2800000000LL);
+    EXPECT_GT(ctx.qswapMgmtToQx(maker, maker, asset, 50000LL), 0LL);
+    EXPECT_GT(ctx.qxAddAsk(maker, maker, asset, 100LL, 3600LL), 0LL);
+
+    ctx.seedPool(0, maker, asset);
+    ctx.fundContract(5000000LL);
+
+    auto before = ctx.getStats();
+    ctx.beginTick();
+    auto after = ctx.getStats();
+
+    EXPECT_GT(after.totalArbsExecuted, before.totalArbsExecuted); // scaled-down trade still executed
+    EXPECT_GT(after.totalProfitEarned, before.totalProfitEarned); // booked net profit
+    EXPECT_GT(ctx.st()->epochProfit, 0LL);
+}
+
+// QX-fee-live toggle: with qxFeeLivePerTrade = 1 the sell leg fetches the QX transfer fee LIVE
+// (CALL_OTHER_CONTRACT_FUNCTION(QX, Fees)) instead of the per-epoch cache. Direction A sells through QX,
+// so run it with the toggle on and confirm the arb still completes — exercising the live-fee path.
+TEST(ContractCLKnDGR, Dagger_QxFeeLiveMode_DirectionA_StillExecutes)
+{
+    ContractTestingCLKnDGRDex ctx;
+    const id     maker = clkUser(50);
+    const uint64 asset = assetNameFromString("CLKQXF");
+
+    // Same shape as Direction A: cheap pool (price 100), rich QX bid (500), sized to clear net + fee.
+    EXPECT_EQ(ctx.qswapIssueAsset(maker, asset, 10000000LL), 10000000LL);
+    EXPECT_TRUE(ctx.qswapCreatePool(maker, maker, asset));
+    ctx.qswapAddLiquidity(maker, maker, asset, 1000000LL, 100000000LL);
+    EXPECT_GT(ctx.qxAddBid(maker, maker, asset, 500LL, 2000LL), 0LL);
+
+    ctx.seedPool(0, maker, asset);
+    ctx.fundContract(5000000LL);
+    ctx.st()->qxFeeLivePerTrade = 1; // force the live QX Fees fetch on the sell leg
+
+    auto before = ctx.getStats();
+    ctx.beginTick();
+    auto after = ctx.getStats();
+
+    EXPECT_GT(after.totalArbsExecuted, before.totalArbsExecuted); // arb completed via the live-fee path
+    EXPECT_GT(ctx.st()->poolReserveTokens.get(0), 0LL);
+}
+
+// Negative: when the QX/Qswap price gap is below minProfitQu, no trade fires.
+TEST(ContractCLKnDGR, Dagger_NoProfitableSpread_NoTrade)
+{
+    ContractTestingCLKnDGRDex ctx;
+    const id     maker = clkUser(50);
+    const uint64 asset = assetNameFromString("CLKARB");
+
+    // Pool price 105, QX ask price 100 — a 5% gap, far under minProfitQu (100,100).
+    EXPECT_EQ(ctx.qswapIssueAsset(maker, asset, 10000000LL), 10000000LL);
+    EXPECT_TRUE(ctx.qswapCreatePool(maker, maker, asset));
+    ctx.qswapAddLiquidity(maker, maker, asset, 1000000LL, 105000000LL);
+    EXPECT_GT(ctx.qswapMgmtToQx(maker, maker, asset, 50000LL), 0LL);
+    EXPECT_GT(ctx.qxAddAsk(maker, maker, asset, 100LL, 400LL), 0LL);
+
+    ctx.seedPool(0, maker, asset);
+    ctx.fundContract(1000000LL);
+
+    auto before = ctx.getStats();
+    ctx.beginTick();
+    auto after = ctx.getStats();
+
+    EXPECT_EQ(after.totalArbsExecuted, before.totalArbsExecuted); // nothing fired
+    EXPECT_EQ(ctx.st()->epochProfit, 0LL);
+}
+
+// ===============================================================
+// VIX volatility sampler (no swap — unaffected by the Qswap-fee bug)
+// ===============================================================
+
+// A large price move vs the last sample spikes the fast EWMA above the breakout floor,
+// which flags a breakout and wakes BOTH Dagger directions onto the fast rescan cooldown.
+TEST(ContractCLKnDGR, Vix_BigPriceMove_FlagsBreakout_WakesDagger)
+{
+    ContractTestingCLKnDGRDex ctx;
+    const id     maker = clkUser(50);
+    const uint64 asset = assetNameFromString("CLKVIX");
+
+    // Pool priced 100 (1,000,000 asset / 100,000,000 QU). No QX orders -> no trade is attempted,
+    // so this exercises only the VIX sampler.
+    EXPECT_EQ(ctx.qswapIssueAsset(maker, asset, 10000000LL), 10000000LL);
+    EXPECT_TRUE(ctx.qswapCreatePool(maker, maker, asset));
+    ctx.qswapAddLiquidity(maker, maker, asset, 1000000LL, 100000000LL);
+
+    ctx.seedPool(0, maker, asset);
+    ctx.fundContract(1000000LL); // >= minProfitQu, else BEGIN_TICK returns before the VIX sampler
+
+    // One baseline sample already taken at an OLD price of 90; the live pool is at 100 (~+11%),
+    // a move large enough to push the fast EWMA past the 25 bps floor and 2x the slow EWMA.
+    auto* s = ctx.st();
+    s->vixSampleCount.set(0, 1);
+    s->vixLastPrice.set(0, 90);
+    s->vixFast.set(0, 0);
+    s->vixSlow.set(0, 0);
+    s->vixLastSampleTick.set(0, 0);
+    s->vixBreakout.set(0, 0);
+
+    // Advance past the sample cadence (default 1 pulse/day) so the sampler runs this tick.
+    system.tick = CLKnDGR::INITIAL_VIX_SAMPLE_INTERVAL + 1;
+    const uint32 nowTick = (uint32)system.tick;
+
+    ctx.beginTick();
+
+    EXPECT_EQ((int)ctx.st()->vixBreakout.get(0),    1);   // breakout flagged
+    EXPECT_EQ((int)ctx.st()->vixSampleCount.get(0), 2);   // a second sample was taken
+    EXPECT_GT(ctx.st()->vixFast.get(0),             0LL); // fast EWMA moved off zero
+    EXPECT_EQ(ctx.st()->vixLastPrice.get(0),        100LL); // baseline advanced to the live price
+
+    // Breakout shortens both Dagger cooldowns to the fast rescan beat (no order book -> each
+    // direction re-arms at tick + breakoutRescanTicks rather than the long calm baseline).
+    const uint32 expectedCd = nowTick + ctx.st()->breakoutRescanTicks;
+    EXPECT_EQ(ctx.st()->poolCooldownTick.get(0),  expectedCd);
+    EXPECT_EQ(ctx.st()->poolCooldownTickA.get(0), expectedCd);
+}
+
+// Type-17 reserve-liquidation sell — LIVE, end-to-end against real Qswap (verifies the R1/R2 fee fix
+// on the liquidation path, the one piece the Dagger tests don't cover directly). A Dir B arb leaves 10%
+// reserve tokens under the contract on-chain; a passed type-17 proposal then sells them on Qswap at
+// END_EPOCH. Sized so the reserve is worth well over the 100K Qswap fee, so the sell books POSITIVE net.
+TEST(ContractCLKnDGR, GovernanceCycle_SellPoolTokens_LiveQswapSell_BooksProceeds)
+{
+    ContractTestingCLKnDGRDex ctx;
+    const id     maker = clkUser(50);
+    const uint64 asset = assetNameFromString("CLKRSV");
+
+    // Governance shareholders (the CLKNDGR token) so the type-17 proposal can pass.
+    std::vector<std::pair<id, int>> owners;
+    for (int i = 0; i < 15; ++i) owners.push_back({clkUser(i), 15});
+    ctx.issueShares(owners);
+    ctx.fundVoters(15);
+
+    // Deep pool priced ~130; cheap QX ask at 100, large size — the arb runs at full size (scaleFactor 1)
+    // and leaves a sizeable 10% reserve (worth >> the 100K Qswap fee).
+    EXPECT_EQ(ctx.qswapIssueAsset(maker, asset, 20000000LL), 20000000LL);
+    EXPECT_TRUE(ctx.qswapCreatePool(maker, maker, asset));
+    ctx.qswapAddLiquidity(maker, maker, asset, 10000000LL, 1300000000LL);
+    EXPECT_GT(ctx.qswapMgmtToQx(maker, maker, asset, 50000LL), 0LL);
+    EXPECT_GT(ctx.qxAddAsk(maker, maker, asset, 100LL, 16000LL), 0LL);
+
+    ctx.seedPool(0, maker, asset);
+    ctx.fundContract(3000000LL);
+
+    // Run the arb -> CLKnDGR now holds the 10% reserve on-chain (owned + managed by the contract).
+    ctx.beginTick();
+    const sint64 reserveAfterArb = ctx.st()->poolReserveTokens.get(0);
+    EXPECT_GT(reserveAfterArb, 0LL);
+
+    // Pass a type-17 proposal to sell 100% of pool 0's reserve.
+    ctx.addEnergy(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+    auto sub = ctx.submitProposal(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_SELL_POOL_TOKENS,
+                                  100LL,  // sell 100% of holdings
+                                  0);     // poolIndex 0
+    EXPECT_EQ(sub.success, 1);
+    for (int i = 0; i < 15; ++i) ctx.voteOnProposal(clkUser(i), sub.slot, 1);
+
+    ctx.endEpoch();
+
+    EXPECT_EQ(ctx.getProposal(sub.slot).status, CLKnDGR::PROP_STATUS_PASSED);
+    EXPECT_LT(ctx.st()->poolReserveTokens.get(0), reserveAfterArb); // reserve was sold down on Qswap
+    EXPECT_GT(ctx.st()->reserveSellProceeds, 0LL);                  // live sell booked net proceeds (after the fee)
+}
+
+// ===============================================================
+// THE CLOAK — swing strategy (live, against real Qswap + QX)
+// ===============================================================
+
+// Cloak dip-buy: a price history where the 1-week (latest) price is >=10% below the 3-month avg triggers
+// a swing entry — the contract buys ~1% of capital on Qswap (now correctly fee-funded). Position opens.
+TEST(ContractCLKnDGR, Cloak_DipBuy_OpensPosition)
+{
+    ContractTestingCLKnDGRDex ctx;
+    const id     maker = clkUser(50);
+    const uint64 asset = assetNameFromString("CLKSWG");
+
+    // Deep pool priced ~100.
+    EXPECT_EQ(ctx.qswapIssueAsset(maker, asset, 20000000LL), 20000000LL);
+    EXPECT_TRUE(ctx.qswapCreatePool(maker, maker, asset));
+    ctx.qswapAddLiquidity(maker, maker, asset, 10000000LL, 1000000000LL);
+
+    ctx.seedPool(0, maker, asset);
+    ctx.fundContract(20000000LL);
+
+    // Seed a 2-sample price history showing a dip: older 100, latest 80 -> 3mo avg 90, 1wk 80 <= 81.
+    auto* s = ctx.st();
+    s->swingPriceCount.set(0, 2);
+    s->swingPriceHead.set(0, 2);
+    s->swingPriceHistory.set(0, 100LL); // pool 0, slot 0 (older)
+    s->swingPriceHistory.set(1, 80LL);  // pool 0, slot 1 (latest = 1-week price)
+
+    EXPECT_EQ(ctx.st()->swingTokens.get(0), 0LL);
+    ctx.beginTick();
+    EXPECT_GT(ctx.st()->swingTokens.get(0), 0LL); // dip-buy opened a swing position
+}
+
+// Cloak gain-sell: once a position sits in profit (pool price >= cost x 112%), the contract exits
+// swingSellPct of it via a QX ask into bids. Here we open the position with a real dip-buy, then drop the
+// cost basis (simulating the price having risen past the +12% trigger), clear the monthly swing cooldown
+// the buy set, post a QX bid for liquidity, and confirm the next tick reduces the position.
+TEST(ContractCLKnDGR, Cloak_GainSell_ReducesPosition)
+{
+    ContractTestingCLKnDGRDex ctx;
+    const id     maker  = clkUser(50);
+    const id     bidder = clkUser(51);
+    const uint64 asset  = assetNameFromString("CLKSWG");
+
+    EXPECT_EQ(ctx.qswapIssueAsset(maker, asset, 20000000LL), 20000000LL);
+    EXPECT_TRUE(ctx.qswapCreatePool(maker, maker, asset));
+    ctx.qswapAddLiquidity(maker, maker, asset, 10000000LL, 1000000000LL);
+
+    ctx.seedPool(0, maker, asset);
+    ctx.fundContract(20000000LL);
+
+    auto* s = ctx.st();
+    s->swingPriceCount.set(0, 2);
+    s->swingPriceHead.set(0, 2);
+    s->swingPriceHistory.set(0, 100LL);
+    s->swingPriceHistory.set(1, 80LL);
+
+    // Step 1: dip-buy opens the on-chain position.
+    ctx.beginTick();
+    const sint64 posAfterBuy = ctx.st()->swingTokens.get(0);
+    EXPECT_GT(posAfterBuy, 0LL);
+
+    // Step 2: put the position firmly in profit (low cost basis vs pool ~100), clear the 30-day swing
+    // cooldown the buy set, and post a QX bid above the discounted ask (pool-10% = ~90) with ample QU.
+    s->swingCostBasis.set(0, 50000LL); // costPerToken ~25 -> pool ~100 well past the +12% trigger
+    s->swingCooldownTick.set(0, 0);
+    EXPECT_GT(ctx.qxAddBid(bidder, maker, asset, 95LL, 5000LL), 0LL);
+
+    // Step 3: the gain-sell exits part of the position via QX.
+    ctx.beginTick();
+    EXPECT_LT(ctx.st()->swingTokens.get(0), posAfterBuy); // partial exit reduced the position
+}
+
+// ===============================================================
+// THE CLOAK — stop-loss (downside exit for a losing bag)
+// ===============================================================
+
+// Stop-loss happy path: a held bag that has fallen to avg cost × (100 - 45)% or below is cut by
+// stopLossSellPct (60%) on Qswap, and STOP_LOSS_EXEC_PCT (10%) of the salvage is burned to the
+// execution-fee reserve. We open a REAL position via a dip-buy (so the contract actually owns tokens
+// to sell), then raise the cost basis so the live pool price (~100) sits far below the -45% trigger,
+// clear the monthly cooldown, and confirm the next tick shrinks the bag AND tops up the fee reserve.
+TEST(ContractCLKnDGR, Cloak_StopLoss_DeepLoser_SellsAndBurns)
+{
+    ContractTestingCLKnDGRDex ctx;
+    const id     maker = clkUser(50);
+    const uint64 asset = assetNameFromString("CLKSL1");
+
+    // Deep pool priced ~100 (10,000,000 asset / 1,000,000,000 QU) so the sale barely moves it.
+    EXPECT_EQ(ctx.qswapIssueAsset(maker, asset, 20000000LL), 20000000LL);
+    EXPECT_TRUE(ctx.qswapCreatePool(maker, maker, asset));
+    ctx.qswapAddLiquidity(maker, maker, asset, 10000000LL, 1000000000LL);
+
+    ctx.seedPool(0, maker, asset);
+    ctx.fundContract(50000000LL); // 1% first buy = 500k QU -> ~5000 tokens; 60% cut -> ~300k proceeds >> 100k fee
+
+    // Open a swing position via a dip-buy (older 100, latest 80 -> 3mo avg 90, 1wk 80 <= 81 -> dip).
+    auto* s = ctx.st();
+    s->swingPriceCount.set(0, 2);
+    s->swingPriceHead.set(0, 2);
+    s->swingPriceHistory.set(0, 100LL);
+    s->swingPriceHistory.set(1, 80LL);
+    ctx.beginTick();
+    const sint64 posAfterBuy = ctx.st()->swingTokens.get(0);
+    EXPECT_GT(posAfterBuy, 0LL);
+
+    // Force a deep loss: costPerToken ~400 vs live pool ~100 => ~75% below cost, well past the -45%
+    // trigger. (The stop-loss runs before the DCA-add and continues, so the dip flag is irrelevant.)
+    s->swingCostBasis.set(0, posAfterBuy * 400LL);
+    s->swingCooldownTick.set(0, 0);                    // clear the monthly cooldown the buy set
+    setContractFeeReserve(CLKnDGR_CONTRACT_INDEX, 0);  // baseline so the 10% burn is observable
+
+    ctx.beginTick();
+
+    EXPECT_LT(ctx.st()->swingTokens.get(0), posAfterBuy);          // bag cut by the stop-loss
+    EXPECT_GT(getContractFeeReserve(CLKnDGR_CONTRACT_INDEX), 0LL); // 10% of salvage burned to exec reserve
+}
+
+// Negative: a bag only mildly underwater (cost 125 vs pool ~100 = 20% below, under the 45% trigger)
+// is NOT cut. Direct-seed the position with NON-dip history so neither the stop-loss nor a DCA-add fires.
+TEST(ContractCLKnDGR, Cloak_StopLoss_ShallowLoss_NoSell)
+{
+    ContractTestingCLKnDGRDex ctx;
+    const id     maker = clkUser(50);
+    const uint64 asset = assetNameFromString("CLKSL2");
+
+    EXPECT_EQ(ctx.qswapIssueAsset(maker, asset, 20000000LL), 20000000LL);
+    EXPECT_TRUE(ctx.qswapCreatePool(maker, maker, asset));
+    ctx.qswapAddLiquidity(maker, maker, asset, 10000000LL, 1000000000LL); // price ~100
+
+    ctx.seedPool(0, maker, asset);
+    ctx.fundContract(50000000LL);
+
+    auto* s = ctx.st();
+    s->swingTokens.set(0, 5000LL);
+    s->swingCostBasis.set(0, 5000LL * 125LL); // costPerToken 125 vs pool ~100 -> only 20% below cost
+    s->swingPriceCount.set(0, 2);
+    s->swingPriceHead.set(0, 2);
+    s->swingPriceHistory.set(0, 100LL);
+    s->swingPriceHistory.set(1, 100LL);       // flat -> NOT a dip -> no DCA-add either
+    s->swingCooldownTick.set(0, 0);
+
+    ctx.beginTick();
+    EXPECT_EQ(ctx.st()->swingTokens.get(0), 5000LL); // shallow loss -> stop-loss does NOT fire
+}
+
+// Negative: with stopLossTriggerPct = 0 the stop-loss is disabled, so even a deeply underwater bag
+// (cost 400 vs pool ~100) is held. NON-dip history so no DCA-add confounds the assertion.
+TEST(ContractCLKnDGR, Cloak_StopLoss_Disabled_NoSell)
+{
+    ContractTestingCLKnDGRDex ctx;
+    const id     maker = clkUser(50);
+    const uint64 asset = assetNameFromString("CLKSL3");
+
+    EXPECT_EQ(ctx.qswapIssueAsset(maker, asset, 20000000LL), 20000000LL);
+    EXPECT_TRUE(ctx.qswapCreatePool(maker, maker, asset));
+    ctx.qswapAddLiquidity(maker, maker, asset, 10000000LL, 1000000000LL); // price ~100
+
+    ctx.seedPool(0, maker, asset);
+    ctx.fundContract(50000000LL);
+
+    auto* s = ctx.st();
+    s->stopLossTriggerPct = 0; // disabled
+    s->swingTokens.set(0, 5000LL);
+    s->swingCostBasis.set(0, 5000LL * 400LL); // deeply underwater, but disabled
+    s->swingPriceCount.set(0, 2);
+    s->swingPriceHead.set(0, 2);
+    s->swingPriceHistory.set(0, 100LL);
+    s->swingPriceHistory.set(1, 100LL);       // NOT a dip
+    s->swingCooldownTick.set(0, 0);
+
+    ctx.beginTick();
+    EXPECT_EQ(ctx.st()->swingTokens.get(0), 5000LL); // disabled -> no cut despite the deep loss
+}
+
+// Type 24 (UPDATE_STOP_LOSS_TRIGGER): a full governance cycle changes the stop-loss cut threshold.
+TEST(ContractCLKnDGR, GovernanceCycle_UpdateStopLossTrigger_Changes)
+{
+    ContractTestingCLKnDGR ctx;
+
+    std::vector<std::pair<id, int>> owners;
+    for (int i = 0; i < 15; ++i)
+        owners.push_back({clkUser(i), 15});
+    ctx.issueShares(owners);
+    ctx.fundVoters(15);
+
+    EXPECT_EQ(ctx.st()->stopLossTriggerPct, 45LL); // default
+
+    ctx.addEnergy(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+    auto sub = ctx.submitProposal(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_STOP_LOSS_TRIGGER, 30LL); // valid 15-step
+    EXPECT_EQ(sub.success, 1);
+    for (int i = 0; i < 15; ++i)
+        ctx.voteOnProposal(clkUser(i), sub.slot, 1);
+
+    ctx.endEpoch();
+
+    EXPECT_EQ(ctx.getProposal(sub.slot).status, CLKnDGR::PROP_STATUS_PASSED);
+    EXPECT_EQ(ctx.st()->stopLossTriggerPct, 30LL);
+}
+
+// Type 24 must reject a value that is not 0 or a 15-point step in [15,90].
+TEST(ContractCLKnDGR, SubmitProposal_UpdateStopLossTrigger_InvalidValue_ContentInvalid)
+{
+    ContractTestingCLKnDGR ctx;
+    const id u = clkUser(1);
+    ctx.issueShares({{u, 50}});
+    ctx.addEnergy(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+
+    auto out = ctx.submitProposal(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_STOP_LOSS_TRIGGER, 40LL); // not a 15-step
+    EXPECT_EQ(out.success, 0);
+    EXPECT_EQ(ctx.st()->proposalsThisEpoch, 0);
+    EXPECT_EQ(ctx.st()->stopLossTriggerPct, 45LL); // unchanged (default)
+}
+
+// Type 25 (UPDATE_STOP_LOSS_SELL): a full governance cycle changes the per-trigger cut fraction.
+TEST(ContractCLKnDGR, GovernanceCycle_UpdateStopLossSell_Changes)
+{
+    ContractTestingCLKnDGR ctx;
+
+    std::vector<std::pair<id, int>> owners;
+    for (int i = 0; i < 15; ++i)
+        owners.push_back({clkUser(i), 15});
+    ctx.issueShares(owners);
+    ctx.fundVoters(15);
+
+    EXPECT_EQ(ctx.st()->stopLossSellPct, 60LL); // default
+
+    ctx.addEnergy(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+    auto sub = ctx.submitProposal(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_STOP_LOSS_SELL, 90LL); // valid 15-step
+    EXPECT_EQ(sub.success, 1);
+    for (int i = 0; i < 15; ++i)
+        ctx.voteOnProposal(clkUser(i), sub.slot, 1);
+
+    ctx.endEpoch();
+
+    EXPECT_EQ(ctx.getProposal(sub.slot).status, CLKnDGR::PROP_STATUS_PASSED);
+    EXPECT_EQ(ctx.st()->stopLossSellPct, 90LL);
+}
+
+// Type 25 must reject a value that is not a 15-point step in [15,90] (0 is NOT valid for the sell %).
+TEST(ContractCLKnDGR, SubmitProposal_UpdateStopLossSell_InvalidValue_ContentInvalid)
+{
+    ContractTestingCLKnDGR ctx;
+    const id u = clkUser(1);
+    ctx.issueShares({{u, 50}});
+    ctx.addEnergy(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+
+    auto out = ctx.submitProposal(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_STOP_LOSS_SELL, 0LL); // 0 invalid for sell %
+    EXPECT_EQ(out.success, 0);
+    EXPECT_EQ(ctx.st()->proposalsThisEpoch, 0);
+    EXPECT_EQ(ctx.st()->stopLossSellPct, 60LL); // unchanged (default)
+}
+
+// ===============================================================
 // INITIALIZE: verify all initial state fields
 // ===============================================================
 
@@ -267,6 +925,8 @@ TEST(ContractCLKnDGR, Initialize_GovernanceDefaults)
     EXPECT_EQ(s->depositorVoteMinQu,         150000000LL);
     EXPECT_EQ(s->relockAddAmount,            CLKnDGR::INITIAL_RELOCK_ADD_AMOUNT);
     EXPECT_EQ(s->minReserveProfitPct,        5);
+    EXPECT_EQ(s->stopLossTriggerPct,         45LL); // default: cut at -45% from avg cost
+    EXPECT_EQ(s->stopLossSellPct,            60LL); // default: sell 60% of the bag per trigger
     EXPECT_EQ(s->poolCount,                  0);
 }
 
@@ -311,6 +971,8 @@ TEST(ContractCLKnDGR, GetGovernanceParams_InitialValues)
     EXPECT_EQ(p.minReserveProfitPct,     5);
     EXPECT_EQ(p.depositorVoteMinQu,      150000000LL);
     EXPECT_EQ(p.relockAddAmount,         CLKnDGR::INITIAL_RELOCK_ADD_AMOUNT);
+    EXPECT_EQ(p.stopLossTriggerPct,      45LL); // default: cut at -45% from avg cost
+    EXPECT_EQ(p.stopLossSellPct,         60LL); // default: sell 60% of the bag per trigger
 }
 
 TEST(ContractCLKnDGR, GetPool_SlotZeroEmptyOnInit)
@@ -1152,7 +1814,7 @@ TEST(ContractCLKnDGR, BeginEpoch_ProfitDistribution_FillsQuReserveAndQearnReserv
     // Issue shares so qpi.distributeDividends has valid recipients
     ctx.issueShares({{clkUser(1), 676}});
 
-    // Seed the contract balance to cover exec(30%)+dist(10%)+burn(0%)+ccf(1%) = 41% of profit
+    // Seed the contract balance to cover exec(30%)+dist(10%)+ccf(1%) = 41% of profit
     const sint64 profit = 10000000LL;
     ctx.addEnergy(id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0), profit);
 
@@ -1169,6 +1831,44 @@ TEST(ContractCLKnDGR, BeginEpoch_ProfitDistribution_FillsQuReserveAndQearnReserv
 
     // epochProfit reset to zero after distribution
     EXPECT_EQ(ctx.st()->epochProfit, 0LL);
+}
+
+// ===============================================================
+// DIVIDEND REGRESSION (core-dev review #3)
+// qpi.distributeDividends() takes a PER-SHARE amount; the total it pays is
+// 676 × that. The contract must therefore pass distribAmount / 676, NOT the
+// whole distribAmount. With the original bug it passed the total, so the call
+// tried to pay 676× that much, failed its internal balance check, returned
+// false, and shareholders received NOTHING. The sibling test above only checks
+// quReserve/qearnReserve — it never noticed. This test pins the actual on-chain
+// receipt: a holder of all 676 shares must see their QU balance rise by exactly
+// the dividend pool. On the buggy code this asserts 676,000 but gets 0 → fails.
+// ===============================================================
+TEST(ContractCLKnDGR, BeginEpoch_DividendReachesShareholder)
+{
+    ContractTestingCLKnDGR ctx;
+
+    const id shareholder = clkUser(1);
+    ctx.issueShares({{shareholder, 676}});      // all 676 IPO shares to one holder
+
+    // Chosen for exact, dust-free math: dist = 10% of profit = 676,000;
+    // per-share = 676,000 / 676 = 1,000; total paid back = 1,000 × 676 = 676,000.
+    const sint64 profit = 6760000LL;
+    ctx.addEnergy(id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0), profit); // cover the whole split
+
+    const sint64 balBefore = getBalance(shareholder);           // 0 — shares carry no QU
+    ctx.st()->epochProfit = profit;
+
+    ctx.beginEpoch();
+
+    // PAYOUT0 (default) dist = 10%. Derive expected the same way the contract does.
+    const sint64 distribAmount = (sint64)(profit * CLKnDGR::PAYOUT0_DIST_PCT / 100); // 676,000
+    const sint64 perShare      = distribAmount / 676;                                 // 1,000
+    const sint64 expectedDiv   = perShare * 676;                                      // 676,000
+
+    EXPECT_GT(expectedDiv, 0LL);                                 // guard: non-vacuous pool
+    EXPECT_EQ(getBalance(shareholder), balBefore + expectedDiv); // the shareholder was PAID
+    EXPECT_EQ(ctx.st()->epochProfit, 0LL);                       // distribution ran to completion
 }
 
 // ===============================================================
@@ -3088,6 +3788,78 @@ TEST(ContractCLKnDGR, SubmitProposal_UpdateBreakoutRescan_InvalidValue_ContentIn
     EXPECT_EQ(out.success, 0);
     EXPECT_EQ(ctx.st()->proposalsThisEpoch, 0);
     EXPECT_EQ(ctx.st()->breakoutRescanTicks, 1200u); // unchanged (default)
+}
+
+// Governable QX-fee freshness (proposal type 23): a ONE-WAY switch — shareholders can flip the sell legs
+// from the per-epoch fee cache (0, default) to a live per-trade QX fee fetch (1), future-proofing for if
+// QX ever makes its transfer fee tick-variable. Once enabled it is PERMANENT (no revert), no re-deploy.
+TEST(ContractCLKnDGR, GovernanceCycle_UpdateQxFeeMode_ChangesMode)
+{
+    ContractTestingCLKnDGR ctx;
+
+    std::vector<std::pair<id, int>> owners;
+    for (int i = 0; i < 15; ++i)
+        owners.push_back({clkUser(i), 15});
+    ctx.issueShares(owners);
+    ctx.fundVoters(15);
+
+    EXPECT_EQ(ctx.st()->qxFeeLivePerTrade, 0); // default: read the per-epoch QX-fee cache
+
+    ctx.addEnergy(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+    auto sub = ctx.submitProposal(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_QX_FEE_MODE, 1LL); // enable live per-trade fetch
+    EXPECT_EQ(sub.success, 1);
+    for (int i = 0; i < 15; ++i)
+        ctx.voteOnProposal(clkUser(i), sub.slot, 1);
+
+    ctx.endEpoch();
+
+    EXPECT_EQ(ctx.getProposal(sub.slot).status, CLKnDGR::PROP_STATUS_PASSED);
+    EXPECT_EQ(ctx.st()->qxFeeLivePerTrade, 1); // now fetches the QX fee live before each sell
+}
+
+// UPDATE_QX_FEE_MODE from cache mode accepts ONLY newValue==1 (enable). 0 (stay cache) and out-of-range
+// values are rejected.
+TEST(ContractCLKnDGR, SubmitProposal_UpdateQxFeeMode_InvalidValue_ContentInvalid)
+{
+    ContractTestingCLKnDGR ctx;
+    const id u = clkUser(1);
+    ctx.issueShares({{u, 50}});
+
+    ctx.addEnergy(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+    auto zero = ctx.submitProposal(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                   CLKnDGR::PROP_TYPE_UPDATE_QX_FEE_MODE, 0LL); // can't propose cache mode
+    EXPECT_EQ(zero.success, 0);
+
+    ctx.addEnergy(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+    auto two = ctx.submitProposal(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_QX_FEE_MODE, 2LL); // out of range
+    EXPECT_EQ(two.success, 0);
+
+    EXPECT_EQ(ctx.st()->proposalsThisEpoch, 0);
+    EXPECT_EQ(ctx.st()->qxFeeLivePerTrade, 0); // unchanged (default)
+}
+
+// UPDATE_QX_FEE_MODE is a one-way latch: once live mode is on, NO type-23 proposal can change it — not
+// back to cache (0), not even re-propose (1). The switch is permanent.
+TEST(ContractCLKnDGR, SubmitProposal_UpdateQxFeeMode_IrreversibleOnceLive)
+{
+    ContractTestingCLKnDGR ctx;
+    const id u = clkUser(1);
+    ctx.issueShares({{u, 50}});
+    ctx.st()->qxFeeLivePerTrade = 1; // already live (a prior epoch's vote enabled it)
+
+    ctx.addEnergy(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+    auto revert = ctx.submitProposal(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                     CLKnDGR::PROP_TYPE_UPDATE_QX_FEE_MODE, 0LL); // try to revert to cache
+    EXPECT_EQ(revert.success, 0);
+
+    ctx.addEnergy(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+    auto reEnable = ctx.submitProposal(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                       CLKnDGR::PROP_TYPE_UPDATE_QX_FEE_MODE, 1LL); // try to re-propose
+    EXPECT_EQ(reEnable.success, 0);
+
+    EXPECT_EQ(ctx.st()->qxFeeLivePerTrade, 1); // still live, never reverted
 }
 
 // Proposal fees fund the execution-fee reserve: 31% at submit, the held 69% on PASS (→ 100%).
