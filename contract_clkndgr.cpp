@@ -655,6 +655,7 @@ TEST(ContractCLKnDGR, Cloak_DipBuy_OpensPosition)
 
     // Seed a 2-sample price history showing a dip: older 100, latest 80 -> 3mo avg 90, 1wk 80 <= 81.
     auto* s = ctx.st();
+    s->swingBuyDipPct = 10; // ~11% dip scenario; pin the threshold so the 30% default doesn't suppress the buy
     s->swingPriceCount.set(0, 2);
     s->swingPriceHead.set(0, 2);
     s->swingPriceHistory.set(0, 100LL); // pool 0, slot 0 (older)
@@ -684,6 +685,7 @@ TEST(ContractCLKnDGR, Cloak_GainSell_ReducesPosition)
     ctx.fundContract(20000000LL);
 
     auto* s = ctx.st();
+    s->swingBuyDipPct = 10; // ~11% dip scenario; pin the threshold so the 30% default doesn't suppress the dip-buy
     s->swingPriceCount.set(0, 2);
     s->swingPriceHead.set(0, 2);
     s->swingPriceHistory.set(0, 100LL);
@@ -730,6 +732,7 @@ TEST(ContractCLKnDGR, Cloak_StopLoss_DeepLoser_SellsAndBurns)
 
     // Open a swing position via a dip-buy (older 100, latest 80 -> 3mo avg 90, 1wk 80 <= 81 -> dip).
     auto* s = ctx.st();
+    s->swingBuyDipPct = 10; // ~11% dip scenario; pin the threshold so the 30% default doesn't suppress the opening dip-buy
     s->swingPriceCount.set(0, 2);
     s->swingPriceHead.set(0, 2);
     s->swingPriceHistory.set(0, 100LL);
@@ -1990,6 +1993,44 @@ TEST(ContractCLKnDGR, BeginEpoch_NAVGrowth_SharePriceIncreases)
     EXPECT_EQ(ctx.st()->totalDepositorPool, 11000000LL);
 }
 
+// NAV BACKING INVARIANT (regression for the payout-slice over-credit fix). The depositor share price must grow
+// ONLY on RETAINED trading capital, so the recorded depositor pool must stay equal to the real depositor backing
+// (balance − reserves, snapshotted as prevTradingBalance) — even across a profit epoch. The fix excludes EVERY
+// payout slice (Qearn + dev + exec + dividend + CCF) from the BEGIN_EPOCH NAV numerator. Here we book 1,000,000
+// profit under preset 3 (100% burned to the exec reserve): none of it is depositor equity, so the pool must NOT
+// rise. (Before the fix the NAV excluded only the Qearn slice, so the pool was over-credited the full 1M —
+// backing 10M but pool 11M. This test was the in-contract proof of that drift; it now verifies the fix.)
+TEST(ContractCLKnDGR, NAV_DepositorPoolStaysBackedAcrossProfitEpoch)
+{
+    ContractTestingCLKnDGR ctx;
+    const id u = clkUser(1);
+    ctx.addEnergy(u, 10000000LL);
+    ctx.vaultDeposit(u, 10000000LL);                 // 1000 shares @ 10000; pool = 10M, prevTradingBalance seeded = 10M
+
+    ctx.beginEpoch();                                // clean baseline epoch, no profit
+    // Sanity: before any profit, the recorded pool equals the real backing — the vault is fully backed.
+    EXPECT_EQ(ctx.st()->totalDepositorPool, ctx.st()->prevTradingBalance);
+    EXPECT_EQ(ctx.st()->totalDepositorPool, 10000000LL);
+
+    // Recovery preset: 100% of booked profit is burned to the exec-fee reserve (leaves the balance entirely).
+    ctx.st()->payoutStructure = 3;
+
+    // Simulate an epoch's trading profit: it lands in the contract balance AND is booked to epochProfit
+    // (exactly what a Direction-B arb does on-chain).
+    ctx.addEnergy(id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0), 1000000LL);
+    ctx.st()->epochProfit = 1000000LL;
+
+    ctx.beginEpoch();                                // NAV lift + profit split (100% burned to exec reserve)
+
+    const sint64 pool    = ctx.st()->totalDepositorPool;   // recorded depositor claim
+    const sint64 backing = ctx.st()->prevTradingBalance;   // real depositor backing = balance − reserves
+    // The 1,000,000 profit was 100% burned to the exec reserve — not depositor equity — so backing is 10M...
+    EXPECT_EQ(backing, 10000000LL);
+    // ...and with the fix the pool stays fully backed: it did NOT rise to 11M. NAV grew on retained capital only.
+    EXPECT_EQ(pool, backing);
+    EXPECT_EQ(pool, 10000000LL);
+}
+
 // A4: Voting twice on the same proposal slot is rejected — only the first vote is counted
 TEST(ContractCLKnDGR, VoteOnProposal_DuplicateVoteRejected)
 {
@@ -2100,7 +2141,7 @@ TEST(ContractCLKnDGR, GovernanceCycle_DepositorVeto_BlocksPassedProposal)
     for (int i = 0; i < 15; ++i)
         ctx.voteOnProposal(clkUser(i), sub.slot, 1); // all YES
 
-    // 125 depositors each holding 15000 shares (150M ÷ price 10000) — exactly meets
+    // 500 depositors each holding 15000 shares (150M ÷ price 10000) — exactly meets
     // depositorVoteMinQu default (150M): lockedQu = 15000 × 10000 = 150M ≥ 150M
     // clkUser(100..224): non-overlapping range from shareholders (0..14)
     for (int i = 0; i < CLKnDGR::DEPOSITOR_VETO_THRESHOLD; ++i)
@@ -2114,7 +2155,7 @@ TEST(ContractCLKnDGR, GovernanceCycle_DepositorVeto_BlocksPassedProposal)
 
     ctx.endEpoch();
 
-    // 125 qualifying NO votes = DEPOSITOR_VETO_THRESHOLD → proposal vetoed despite supermajority
+    // 500 qualifying NO votes = DEPOSITOR_VETO_THRESHOLD → proposal vetoed despite supermajority
     auto prop = ctx.getProposal(sub.slot);
     EXPECT_EQ(prop.status, CLKnDGR::PROP_STATUS_FAILED);
     EXPECT_EQ(ctx.st()->minProfitQu, CLKnDGR::MIN_PROFIT_QU); // parameter unchanged
@@ -4276,4 +4317,267 @@ TEST(ContractCLKnDGR, BeginEpoch_WaitlistPromotion_SharePriceTooHigh_EntryRefund
     EXPECT_EQ(ctx.st()->waitlistQu, 0LL);
     EXPECT_EQ(ctx.st()->depositorCount, 0);
     EXPECT_EQ(ctx.st()->totalVaultShares, 0LL);
+}
+
+// ===============================================================
+// PROPERTY-BASED / FUZZ TESTS  (added 2026-06-24)
+// ---------------------------------------------------------------
+// The unit tests above check specific, hand-picked cases. These instead
+// hammer the contract with THOUSANDS of randomized inputs and, after every
+// single call, assert "invariants" — properties that must hold no matter
+// what any caller does. The RNG uses a FIXED seed, so any failure is fully
+// reproducible. This is the automated generalization of the taint audit:
+// it proves no random/adversarial input reaches a sink and corrupts state.
+// ===============================================================
+namespace {
+// Tiny deterministic xorshift64 PRNG (seeded → identical sequence every run).
+struct FuzzRng
+{
+    unsigned long long s;
+    explicit FuzzRng(unsigned long long seed) : s(seed ? seed : 0x9E3779B97F4A7C15ULL) {}
+    unsigned long long next() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; }
+    unsigned long long below(unsigned long long n) { return n ? (next() % n) : 0ULL; }
+    sint64 between(sint64 lo, sint64 hi)
+    { return (hi <= lo) ? lo : lo + (sint64)(next() % (unsigned long long)(hi - lo + 1)); }
+};
+} // namespace
+
+// FUZZ 1 — Random governance / vote / read traffic must never corrupt core state or crash.
+// Most random submitProposal inputs are invalid and must be rejected; the structural caps
+// (proposal slots, voter count, payout range, share-price floor) must ALWAYS hold. The
+// random slots fed to voteOnProposal/depositorVeto/getProposal directly exercise the
+// array-index bounds guards. Reset is via BEGIN_EPOCH only (no END_EPOCH apply path → no
+// inter-contract DEX calls, which would need sibling contracts not present in this fixture).
+TEST(ContractCLKnDGR, Fuzz_GovernanceInputs_NeverCorruptState)
+{
+    ContractTestingCLKnDGR ctx;
+    FuzzRng rng(0xC10A11D6C0DEULL);
+
+    // 20 shareholders (so submit/vote clear the >=1-share gate), all funded.
+    std::vector<std::pair<id, int>> owners;
+    for (int i = 0; i < 20; ++i) owners.push_back({clkUser(i), 10});
+    ctx.issueShares(owners);
+    for (int i = 0; i < 20; ++i) ctx.addEnergy(clkUser(i), 1000000000000LL);
+
+    for (int iter = 0; iter < 2000; ++iter)
+    {
+        const id actor = clkUser(rng.below(20));
+        switch ((int)rng.below(5))
+        {
+        case 0: // submitProposal: wild type/value/index — mostly invalid, must be rejected cleanly
+            ctx.addEnergy(actor, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+            ctx.submitProposal(actor, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                               (uint8)rng.below(40),                 // type 0..39 (valid 1..25)
+                               rng.between(-5, 1000000000LL),        // newValue
+                               rng.below(8));                        // poolIndex (some out of range)
+            break;
+        case 1: ctx.voteOnProposal(actor, (uint8)rng.below(256), (uint8)rng.below(256)); break;
+        case 2: ctx.depositorVeto(actor, (uint8)rng.below(256), (uint8)rng.below(256)); break;
+        case 3: ctx.getPool(rng.next()); ctx.getProposal((uint8)rng.below(256)); break; // index sinks
+        case 4: ctx.beginEpoch(); break;                                                // resets gov state
+        }
+
+        auto* s = ctx.st();
+        ASSERT_LE((int)s->proposalsThisEpoch, (int)CLKnDGR::MAX_PROPOSALS_PER_EPOCH) << "iter=" << iter;
+        ASSERT_LE((int)s->voterCount,         (int)CLKnDGR::PROPOSAL_VOTER_CAPACITY) << "iter=" << iter;
+        ASSERT_LE((int)s->payoutStructure,    3)                                     << "iter=" << iter;
+        ASSERT_GE(s->vaultSharePrice,         1LL)                                    << "iter=" << iter;
+    }
+}
+
+// FUZZ 2 — Random vault money-flows must keep the vault SOLVENT and self-consistent.
+// No injected profit and no epoch settle here, so the depositor pool must stay fully backed
+// by the contract's liquid QU at all times. This is the property the NAV fix guarantees;
+// fuzzing it across thousands of random deposit/withdraw/relock/donate sequences generalizes
+// the single-scenario NAV regression test.
+TEST(ContractCLKnDGR, Fuzz_VaultOps_StaySolventAndConsistent)
+{
+    ContractTestingCLKnDGR ctx;
+    FuzzRng rng(0x5A1AD7EE5EEDULL);
+
+    const int NUSERS = 30;
+    for (int i = 0; i < NUSERS; ++i) ctx.addEnergy(clkUser(i), 100000000000LL);
+    const id self = id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0);
+
+    for (int iter = 0; iter < 2000; ++iter)
+    {
+        const id actor = clkUser(rng.below(NUSERS));
+        switch ((int)rng.below(6))
+        {
+        case 0: { sint64 a = rng.between(1, 50000000LL); if (getBalance(actor) < a) ctx.addEnergy(actor, a); ctx.vaultDeposit(actor, a); break; }
+        case 1: ctx.vaultWithdraw(actor); break;
+        case 2: { sint64 a = rng.between(1, 60000000LL); if (getBalance(actor) < a) ctx.addEnergy(actor, a); ctx.vaultRelock(actor, a); break; }
+        case 3: { sint64 a = rng.between(1, 10000000LL); if (getBalance(actor) < a) ctx.addEnergy(actor, a); ctx.donateToContract(actor, a); break; }
+        case 4: { sint64 a = rng.between(1, 10000000LL); if (getBalance(actor) < a) ctx.addEnergy(actor, a); ctx.publicDonate(actor, a); break; }
+        case 5: ctx.waitlistWithdraw(actor); break;
+        }
+
+        auto* s = ctx.st();
+        ASSERT_GE(s->vaultSharePrice,    1LL)  << "iter=" << iter;   // no div-by-zero / infinite shares
+        ASSERT_GE(s->totalVaultShares,   0LL)  << "iter=" << iter;   // no underflow
+        ASSERT_GE(s->totalDepositorPool, 0LL)  << "iter=" << iter;
+        ASSERT_LE((int)s->depositorCount, (int)CLKnDGR::MAX_DEPOSITORS) << "iter=" << iter;
+        ASSERT_LE((int)s->waitlistCount,  (int)CLKnDGR::WAITLIST_SIZE)  << "iter=" << iter;
+        if (s->totalVaultShares == 0) ASSERT_EQ(s->totalDepositorPool, 0LL) << "iter=" << iter; // empty => no pool
+        // SOLVENCY: depositor pool must be backed by liquid QU on hand.
+        const sint64 liquid = getBalance(self) - s->quReserve - s->qearnReserve
+                              - s->waitlistQu - s->reserveSellProceeds;
+        ASSERT_LE(s->totalDepositorPool, liquid) << "iter=" << iter;
+    }
+}
+
+// FUZZ 3 — The read-only index sinks must never crash or read out of bounds, for ANY index.
+TEST(ContractCLKnDGR, Fuzz_ReadFunctions_RandomIndices_NoCrash)
+{
+    ContractTestingCLKnDGR ctx;
+    FuzzRng rng(0xDEAD10C0DE5ULL);
+
+    // Seed a small, partially-active pool table (real + inactive + out-of-range slots).
+    for (uint64 p = 0; p < 4; ++p)
+    {
+        ctx.st()->poolAssetNames.set(p, 0x5152535400000000ULL + p);
+        ctx.st()->poolIssuers.set(p, clkUser(80 + p));
+        ctx.st()->poolActive.set(p, (uint8)(p & 1));
+    }
+    ctx.st()->poolCount = 4;
+
+    // Clearly out-of-range indices must report inactive — never crash or return garbage.
+    EXPECT_EQ((int)ctx.getPool(1000000ULL).active, 0);
+    EXPECT_EQ((int)ctx.getPool(0xFFFFFFFFFFFFFFFFULL).active, 0);
+
+    for (int iter = 0; iter < 4000; ++iter)
+    {
+        ctx.getPool(rng.next());                // full uint64 index range
+        ctx.getProposal((uint8)rng.below(256)); // full uint8 slot range
+        ctx.getWaitlistPosition();
+    }
+    SUCCEED(); // 4000 random index reads with no crash = the read-only taint surface is safe
+}
+
+// ===============================================================
+// Governable Cloak knobs (proposal types 26/27/28) — added 2026-06-24
+// ===============================================================
+
+// Defaults: sizing preset 0, buy-dip 10%, rally-sell 12%.
+TEST(ContractCLKnDGR, GetGovernanceParams_SwingKnobDefaults)
+{
+    ContractTestingCLKnDGR ctx;
+    auto gp = ctx.getGovernanceParams();
+    EXPECT_EQ((int)gp.swingSizingPreset, 0);
+    EXPECT_EQ(gp.swingBuyDipPct,   30LL);
+    EXPECT_EQ(gp.swingSellGainPct, 6LL);
+    EXPECT_EQ((int)ctx.st()->swingSizingPreset, 0);
+    EXPECT_EQ(ctx.st()->swingBuyDipPct,   30LL);
+    EXPECT_EQ(ctx.st()->swingSellGainPct, 6LL);
+}
+
+// Type 26: UPDATE_SWING_SIZING — full cycle switches the position-sizing preset (0 -> 2).
+TEST(ContractCLKnDGR, GovernanceCycle_UpdateSwingSizing_ChangesPreset)
+{
+    ContractTestingCLKnDGR ctx;
+    std::vector<std::pair<id, int>> owners;
+    for (int i = 0; i < 15; ++i) owners.push_back({clkUser(i), 15});
+    ctx.issueShares(owners);
+    ctx.fundVoters(15);
+
+    EXPECT_EQ((int)ctx.st()->swingSizingPreset, 0); // default
+
+    ctx.addEnergy(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+    auto sub = ctx.submitProposal(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_SWING_SIZING, 2LL); // 2 = 2%/0.50%/10%
+    EXPECT_EQ(sub.success, 1);
+    for (int i = 0; i < 15; ++i) ctx.voteOnProposal(clkUser(i), sub.slot, 1);
+    ctx.endEpoch();
+
+    EXPECT_EQ(ctx.getProposal(sub.slot).status, CLKnDGR::PROP_STATUS_PASSED);
+    EXPECT_EQ((int)ctx.st()->swingSizingPreset, 2);
+}
+
+// Type 26 rejects an out-of-range preset (4 > max 3).
+TEST(ContractCLKnDGR, SubmitProposal_UpdateSwingSizing_InvalidValue_ContentInvalid)
+{
+    ContractTestingCLKnDGR ctx;
+    const id u = clkUser(1);
+    ctx.issueShares({{u, 50}});
+    ctx.addEnergy(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+
+    auto out = ctx.submitProposal(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_SWING_SIZING, 4LL); // out of range
+    EXPECT_EQ(out.success, 0);
+    EXPECT_EQ(ctx.st()->proposalsThisEpoch, 0);
+    EXPECT_EQ((int)ctx.st()->swingSizingPreset, 0); // unchanged
+}
+
+// Type 27: UPDATE_SWING_DIP — full cycle changes the buy-dip threshold (10 -> 25).
+TEST(ContractCLKnDGR, GovernanceCycle_UpdateSwingDip_ChangesThreshold)
+{
+    ContractTestingCLKnDGR ctx;
+    std::vector<std::pair<id, int>> owners;
+    for (int i = 0; i < 15; ++i) owners.push_back({clkUser(i), 15});
+    ctx.issueShares(owners);
+    ctx.fundVoters(15);
+
+    EXPECT_EQ(ctx.st()->swingBuyDipPct, 30LL); // default
+
+    ctx.addEnergy(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+    auto sub = ctx.submitProposal(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_SWING_DIP, 25LL);
+    EXPECT_EQ(sub.success, 1);
+    for (int i = 0; i < 15; ++i) ctx.voteOnProposal(clkUser(i), sub.slot, 1);
+    ctx.endEpoch();
+
+    EXPECT_EQ(ctx.getProposal(sub.slot).status, CLKnDGR::PROP_STATUS_PASSED);
+    EXPECT_EQ(ctx.st()->swingBuyDipPct, 25LL);
+}
+
+// Type 27 rejects a value off the 5-step grid (12 is a valid RALLY value but not a DIP value).
+TEST(ContractCLKnDGR, SubmitProposal_UpdateSwingDip_InvalidValue_ContentInvalid)
+{
+    ContractTestingCLKnDGR ctx;
+    const id u = clkUser(1);
+    ctx.issueShares({{u, 50}});
+    ctx.addEnergy(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+
+    auto out = ctx.submitProposal(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_SWING_DIP, 12LL); // not in {5,10,15,20,25,30}
+    EXPECT_EQ(out.success, 0);
+    EXPECT_EQ(ctx.st()->proposalsThisEpoch, 0);
+    EXPECT_EQ(ctx.st()->swingBuyDipPct, 30LL); // unchanged
+}
+
+// Type 28: UPDATE_SWING_RALLY — full cycle changes the rally-sell threshold (12 -> 18).
+TEST(ContractCLKnDGR, GovernanceCycle_UpdateSwingRally_ChangesThreshold)
+{
+    ContractTestingCLKnDGR ctx;
+    std::vector<std::pair<id, int>> owners;
+    for (int i = 0; i < 15; ++i) owners.push_back({clkUser(i), 15});
+    ctx.issueShares(owners);
+    ctx.fundVoters(15);
+
+    EXPECT_EQ(ctx.st()->swingSellGainPct, 6LL); // default
+
+    ctx.addEnergy(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+    auto sub = ctx.submitProposal(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_SWING_RALLY, 18LL);
+    EXPECT_EQ(sub.success, 1);
+    for (int i = 0; i < 15; ++i) ctx.voteOnProposal(clkUser(i), sub.slot, 1);
+    ctx.endEpoch();
+
+    EXPECT_EQ(ctx.getProposal(sub.slot).status, CLKnDGR::PROP_STATUS_PASSED);
+    EXPECT_EQ(ctx.st()->swingSellGainPct, 18LL);
+}
+
+// Type 28 rejects a value off the 6-step grid (10 is a valid DIP value but not a RALLY value).
+TEST(ContractCLKnDGR, SubmitProposal_UpdateSwingRally_InvalidValue_ContentInvalid)
+{
+    ContractTestingCLKnDGR ctx;
+    const id u = clkUser(1);
+    ctx.issueShares({{u, 50}});
+    ctx.addEnergy(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+
+    auto out = ctx.submitProposal(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_SWING_RALLY, 10LL); // not in {6,12,18,24,30}
+    EXPECT_EQ(out.success, 0);
+    EXPECT_EQ(ctx.st()->proposalsThisEpoch, 0);
+    EXPECT_EQ(ctx.st()->swingSellGainPct, 6LL); // unchanged
 }

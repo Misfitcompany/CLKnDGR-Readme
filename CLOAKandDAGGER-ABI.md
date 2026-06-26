@@ -115,7 +115,7 @@ Replace `SLOT_NUMBER` with `0` through `9`. A proposal is active when the second
 newValue, withdrawAmount, destination, votesYes, votesNo, feePaid,
 **depositorVotesNo**, **depositorVotesYes**
 
-> The last two fields are depositor veto votes. `depositorVotesNo` reaching **125** will
+> The last two fields are depositor veto votes. `depositorVotesNo` reaching **500** will
 > block the proposal at epoch end even if shareholders passed it.
 
 ### Step 2 — Cast your vote
@@ -659,7 +659,7 @@ only the sampling frequency changes (the averaging auto-scales with the rate).
 #### Type 21 — UPDATE_SWING_SELL_PCT
 
 Sets the Cloak's **sell chunk** — what percentage of a held swing position it sells each time that
-position hits its +12%-over-cost sell trigger. Higher = takes profit faster (less left riding); lower =
+position hits its rally-sell trigger (Type 28; default 6% over cost). Higher = takes profit faster (less left riding); lower =
 exits more gradually.
 
 **Fee:** 50,000,000 QU
@@ -745,7 +745,7 @@ A value of 0, any out-of-range value, or any type-23 proposal submitted once alr
 #### Type 24 — UPDATE_STOP_LOSS_TRIGGER
 
 Sets the Cloak's **stop-loss depth** — how far a held swing bag must fall **below its average cost per
-token** before the contract begins cutting it. This is the downside counterpart to the +12% gain exit:
+token** before the contract begins cutting it. This is the downside counterpart to the rally-sell exit (Type 28):
 without it, a bag the Cloak bought into is only ever added to (on further dips) or sold for a gain, so a
 dead asset would be held forever, dragging NAV. **0 disables the stop-loss entirely.**
 
@@ -802,6 +802,75 @@ the stop-loss via Type 24 instead.)
 "25uint8, 0uint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid, 0uint64, <newValue>sint64, 0sint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid"
 ```
 
+#### Type 26 — UPDATE_SWING_SIZING
+
+Selects the Cloak's **position-sizing preset** — a single bundle controlling the first-buy size, the
+DCA-in add size, and the per-token cost cap. Higher presets deploy capital faster and allow larger
+single-token positions.
+
+**Fee:** 50,000,000 QU
+
+**Validation:** `newValue` must be 0, 1, 2, or 3.
+
+| newValue | First buy | DCA-in add | Per-token cap |
+|---|---|---|---|
+| 0 (default) | 1% of capital | 0.25% | 5% |
+| 1 | 1% | 0.25% | 7.5% |
+| 2 | 2% | 0.50% | 10% |
+| 3 | 3% | 0.25% | 15% |
+
+**Format string:**
+```
+"26uint8, 0uint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid, 0uint64, <newValue>sint64, 0sint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid"
+```
+
+#### Type 27 — UPDATE_SWING_DIP
+
+Sets the Cloak's **buy-dip threshold** — how far the 1-week average price must sit below the 3-month
+average before the Cloak treats a pool as "in a dip" and starts buying. Larger = more patient (only buys
+deeper dips).
+
+**Fee:** 50,000,000 QU
+
+**Validation:** `newValue` must be a 5-point step: 5, 10, 15, 20, 25, 30.
+
+| newValue | Buys when 1-wk avg is below 3-mo avg by |
+|---|---|
+| 5 | 5% |
+| 10 | 10% |
+| 15 | 15% |
+| 20 | 20% |
+| 25 | 25% |
+| 30 (default) | 30% |
+
+**Format string:**
+```
+"27uint8, 0uint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid, 0uint64, <newValue>sint64, 0sint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid"
+```
+
+#### Type 28 — UPDATE_SWING_RALLY
+
+Sets the Cloak's **rally-sell threshold** — how far the pool price must rise above the position's average
+cost before the Cloak starts selling (scaling out by `swingSellPct` each time). Smaller = takes profit
+sooner.
+
+**Fee:** 50,000,000 QU
+
+**Validation:** `newValue` must be a 6-point step: 6, 12, 18, 24, 30.
+
+| newValue | Sells when price is above cost by |
+|---|---|
+| 6 (default) | 6% |
+| 12 | 12% |
+| 18 | 18% |
+| 24 | 24% |
+| 30 | 30% |
+
+**Format string:**
+```
+"28uint8, 0uint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid, 0uint64, <newValue>sint64, 0sint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid"
+```
+
 ---
 
 ### Consensus requirements
@@ -811,7 +880,7 @@ For a proposal to pass at epoch end, **all four** conditions must be met:
 1. **≥15 unique qualified voters** must have voted (governable via UPDATE_MIN_QUORUM)
 2. **≥222 total weighted shares** must have voted yes or no combined
 3. **≥2/3 of weighted votes** must be yes (supermajority)
-4. **Fewer than 125 qualifying depositor NO votes** (depositor veto; see Section 5)
+4. **Fewer than 500 qualifying depositor NO votes** (depositor veto; see Section 5)
 
 If conditions 1–3 are met but condition 4 fails, the proposal is **vetoed** and the
 proposer receives the standard 69% fee refund.
@@ -925,11 +994,14 @@ Returns all governable parameters in a single call. No input required.
 | `vixBreakoutFactor` | sint64 | VIX breakout sensitivity ×100 (200 = 2.00×): how far a token's recent volatility must exceed its own baseline to wake the Dagger |
 | `vixAbsFloorBps` | sint64 | Minimum absolute recent volatility (basis points) for a breakout to count |
 | `vixSampleInterval` | uint32 | Ticks between VIX price samples (345600 = 1/day, 172800 = 2/day, 115200 = 3/day) |
-| `swingSellPct` | sint64 | Cloak sell chunk: % of a held bag sold each time the +12% trigger fires |
+| `swingSellPct` | sint64 | Cloak sell chunk: % of a held bag sold each time the rally-sell trigger fires |
 | `stopLossTriggerPct` | sint64 | Cloak stop-loss depth: cut a held bag once its price is this % below average cost (0 = disabled) |
 | `stopLossSellPct` | sint64 | Cloak stop-loss: % of a losing bag sold each time the stop-loss triggers |
 | `breakoutRescanTicks` | uint32 | Dagger hot re-scan pace in ticks (÷4 = seconds) while a pool is breaking out |
 | `qxFeeLivePerTrade` | uint8 | QX-fee source: 0 = per-epoch cached fee (default); 1 = fetch live before each sell. One-way latch — once 1, permanent |
+| `swingSizingPreset` | uint8 | Cloak position-sizing preset 0-3 (first-buy/DCA-add/cap bundle: 0 = 1%/0.25%/5%, 1 = 1%/0.25%/7.5%, 2 = 2%/0.50%/10%, 3 = 3%/0.25%/15%) |
+| `swingBuyDipPct` | sint64 | Cloak buy-dip threshold: buys when the 1-week avg is this % below the 3-month avg (default 30) |
+| `swingSellGainPct` | sint64 | Cloak rally-sell threshold: sells when price is this % above cost per token (default 6) |
 
 ---
 
@@ -1083,7 +1155,7 @@ Both procedure IDs behave identically.
 
 ## Section 5 — Depositor Veto Process
 
-Vault depositors can veto any shareholder-passed proposal by accumulating **125 qualifying
+Vault depositors can veto any shareholder-passed proposal by accumulating **500 qualifying
 NO votes** before epoch end. A vetoed proposal is treated as failed (proposer receives the
 standard 69% fee refund).
 
@@ -1131,7 +1203,7 @@ Query slots 0–9 to find active proposals (status = 1):
 ```
 
 Check `depositorVotesNo` (13th field) to see how many depositor NO votes have already been cast.
-The veto triggers at **125** qualifying NO votes.
+The veto triggers at **500** qualifying NO votes.
 
 ---
 
@@ -1186,7 +1258,7 @@ At the end of the epoch, the contract:
 
 1. Re-validates every depositor NO vote against current locked QU
 2. Counts only those still meeting the `depositorVoteMinQu` threshold
-3. If the re-validated count is **≥125**, the proposal is set to FAILED and the proposer
+3. If the re-validated count is **≥500**, the proposal is set to FAILED and the proposer
    receives a 69% fee refund — regardless of whether shareholders voted yes
 
 ---

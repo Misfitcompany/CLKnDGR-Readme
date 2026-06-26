@@ -119,7 +119,7 @@ struct CLKnDGR : public ContractBase
     // Depositor governance veto constants
     static constexpr uint16 MAX_DEPOSITORS           = 5000;         // max depositor vault slots; raised above IPO share count to allow broader participation
     // depositorVoteMinQu is a governable state field (initial: 150M); valid values: 50000000, 150000000, 250000000, 350000000
-    static constexpr uint16 DEPOSITOR_VETO_THRESHOLD = 125;          // depositor NO votes required to veto a shareholder-passed proposal
+    static constexpr uint16 DEPOSITOR_VETO_THRESHOLD = 500;          // depositor NO votes required to veto a shareholder-passed proposal
     static constexpr uint16 WAITLIST_SIZE            = 500;          // max wallets queued for a vault slot; served largest-first when slots open
     // NOTE: QPI requires power-of-2 container capacities (qpi.h static_assert L && !(L & (L-1))).
     // The container template args below are the next 2^N ABOVE these logical caps; the caps still
@@ -133,8 +133,8 @@ struct CLKnDGR : public ContractBase
     static constexpr uint64 SWING_DCA_ADD_DIVISOR        = 400;      // each DCA-in add = trading capital / 400 = 0.25% (the first buy is SWING_BUY_CAPITAL_PCT = 1%)
     static constexpr uint64 MAX_SWING_POSITION_PCT       = 5;        // stop DCA-adding once a token's cost basis reaches 5% of trading capital (re-opens as capital grows or it sells)
     static constexpr uint8  SWING_PRICE_SLOTS            = 13;     // rolling epoch price buffer (~3 months)
-    static constexpr uint64 SWING_BUY_DIP_PCT            = 10;     // buy when 1-week avg <= 3-month avg × 90%
-    static constexpr uint64 SWING_SELL_GAIN_PCT          = 12;     // sell when pool price >= cost per token × 112%
+    static constexpr uint64 SWING_BUY_DIP_PCT            = 30;     // DEFAULT buy-dip threshold: buy when 1-week avg <= 3-month avg × 70% (30% below); governable via PROP_TYPE_UPDATE_SWING_DIP
+    static constexpr uint64 SWING_SELL_GAIN_PCT          = 6;      // DEFAULT rally-sell threshold: sell when pool price >= cost per token × 106% (6% above); governable via PROP_TYPE_UPDATE_SWING_RALLY
     static constexpr uint64 INITIAL_SWING_SELL_PCT       = 50;     // default: sell 50% of the swing bag per +12% trigger; governable via PROP_TYPE_UPDATE_SWING_SELL_PCT
     static constexpr uint64 SWING_BUY_CAPITAL_PCT        = 1;      // 1% of tradingBalance per swing buy
     static constexpr uint64 SWING_LIQUIDITY_REQUIRED_PCT = 80;     // min % of desired QU available in QX bid book
@@ -147,6 +147,30 @@ struct CLKnDGR : public ContractBase
     static constexpr uint64 STOP_LOSS_EXEC_PCT           = 10;     // % of loss-sale proceeds burned to the execution-fee reserve (keeps the engine funded exactly when losses starve the normal profit-funded top-up)
     static constexpr uint64 INITIAL_STOP_LOSS_TRIGGER_PCT = 45;    // default: cut once a bag is >= 45% below average cost; 0 = disabled; governable in 15-point steps via PROP_TYPE_UPDATE_STOP_LOSS_TRIGGER
     static constexpr uint64 INITIAL_STOP_LOSS_SELL_PCT    = 60;    // default: sell 60% of the bag per stop-loss trigger (scale out, never dump all at once); governable in 15-point steps via PROP_TYPE_UPDATE_STOP_LOSS_SELL
+
+    // Cloak position-sizing presets (governable via PROP_TYPE_UPDATE_SWING_SIZING; swingSizingPreset 0..3).
+    // Each preset bundles three values: first-buy % of capital, the DCA-add divisor, and the per-token
+    // cost cap in BASIS POINTS (bps; 500 = 5%, 750 = 7.5%) so a non-integer cap stays exact in integer math.
+    //   0 (default): 1% / 0.25% (div 400) / 5%      1: 1% / 0.25% (div 400) / 7.5%
+    //   2:           2% / 0.50% (div 200) / 10%     3: 3% / 0.25% (div 400) / 15%
+    static uint64 swingFirstBuyPctForPreset(uint8 p)
+    {
+        if (p == 2) { return 2; }
+        if (p == 3) { return 3; }
+        return SWING_BUY_CAPITAL_PCT; // 1% (presets 0 and 1)
+    }
+    static uint64 swingAddDivisorForPreset(uint8 p)
+    {
+        if (p == 2) { return 200; }   // 0.50%
+        return SWING_DCA_ADD_DIVISOR; // 400 = 0.25% (presets 0, 1, 3)
+    }
+    static uint64 swingCapBpsForPreset(uint8 p)
+    {
+        if (p == 1) { return 750; }   // 7.5%
+        if (p == 2) { return 1000; }  // 10%
+        if (p == 3) { return 1500; }  // 15%
+        return MAX_SWING_POSITION_PCT * 100; // 500 bps = 5% (preset 0 default)
+    }
 
     // ---------------------------------------------------------------
     // VIX — volatility-gated Dagger constants
@@ -190,6 +214,9 @@ struct CLKnDGR : public ContractBase
     static constexpr uint8 PROP_TYPE_UPDATE_QX_FEE_MODE       = 23; // ONE-WAY latch: enable live QX-fee mode (newValue must be 1); flips qxFeeLivePerTrade 0->1 PERMANENTLY. Once live it can never revert to the per-epoch cache (future-proof if QX ever makes its fee tick-variable)
     static constexpr uint8 PROP_TYPE_UPDATE_STOP_LOSS_TRIGGER = 24; // update stopLossTriggerPct (Cloak deep-loser cut threshold, % below avg cost); newValue = 0(off),15,30,45,60,75,90 (default 45)
     static constexpr uint8 PROP_TYPE_UPDATE_STOP_LOSS_SELL    = 25; // update stopLossSellPct (% of a losing bag sold per stop-loss trigger); newValue = 15,30,45,60,75,90 (default 60)
+    static constexpr uint8 PROP_TYPE_UPDATE_SWING_SIZING     = 26; // update swingSizingPreset (Cloak first-buy/DCA-add/cap bundle); newValue = 0,1,2,3 (default 0 = 1%/0.25%/5%)
+    static constexpr uint8 PROP_TYPE_UPDATE_SWING_DIP        = 27; // update swingBuyDipPct (Cloak buy-dip threshold, % below 3-month avg); newValue = 5,10,15,20,25,30 (default 30)
+    static constexpr uint8 PROP_TYPE_UPDATE_SWING_RALLY      = 28; // update swingSellGainPct (Cloak rally-sell threshold, % above cost); newValue = 6,12,18,24,30 (default 6)
 
     // ---------------------------------------------------------------
     // Direct action constants
@@ -284,6 +311,9 @@ struct CLKnDGR : public ContractBase
         sint64 stopLossSellPct;    // Cloak stop-loss: % of a losing bag sold per trigger
         uint32 breakoutRescanTicks;// Dagger breakout re-scan pace (ticks; ÷4 = seconds)
         uint8  qxFeeLivePerTrade;  // 0 = use cached QX fee (default), 1 = fetch QX fee live before each sell
+        uint8  swingSizingPreset;  // Cloak position-sizing preset 0..3 (first-buy/DCA-add/cap bundle)
+        sint64 swingBuyDipPct;     // Cloak buy-dip threshold (% below 3-month avg)
+        sint64 swingSellGainPct;   // Cloak rally-sell threshold (% above cost per token)
     };
 
     struct submitProposal_input
@@ -711,7 +741,7 @@ struct CLKnDGR : public ContractBase
         Array<sint64, 256>  swingTokens;      // tokens held per pool from swing buys
         Array<sint64, 256>  swingCostBasis;   // total QU paid for swingTokens per pool
 
-        // Per-pool cooldown shared by buy and sell actions (25-hour duration)
+        // Per-pool cooldown shared by buy and sell actions (~30-day / monthly — SWING_COOLDOWN_TICKS)
         Array<uint32, 256>  swingCooldownTick;
 
         // Swing TSRM recovery — tokens stuck under a DEX's managing rights.
@@ -737,9 +767,12 @@ struct CLKnDGR : public ContractBase
         sint64 vixBreakoutFactor;  // breakout multiplier ×100 (200 = 2.00×); governable via PROP_TYPE_UPDATE_VIX_FACTOR
         sint64 vixAbsFloorBps;     // min fast vol (bps) to count as a breakout; governable via PROP_TYPE_UPDATE_VIX_FLOOR
         uint32 vixSampleInterval;  // ticks between VIX pulses (345600=1/day default, 172800=2/day, 115200=3/day); governable via PROP_TYPE_UPDATE_VIX_PULSE_RATE
-        sint64 swingSellPct;       // Cloak: % of a swing bag sold per +12% trigger; default 50; governable via PROP_TYPE_UPDATE_SWING_SELL_PCT
+        sint64 swingSellPct;       // Cloak: % of a swing bag sold per rally-sell trigger (swingSellGainPct); default 50; governable via PROP_TYPE_UPDATE_SWING_SELL_PCT
         sint64 stopLossTriggerPct; // Cloak stop-loss: cut a bag once pool price <= avg cost × (100 - this)%; default 45; 0 = disabled; governable via PROP_TYPE_UPDATE_STOP_LOSS_TRIGGER
         sint64 stopLossSellPct;    // Cloak stop-loss: % of the losing bag sold per trigger; default 60; governable via PROP_TYPE_UPDATE_STOP_LOSS_SELL
+        uint8  swingSizingPreset;  // Cloak position-sizing preset 0..3 (first-buy/DCA-add/cap bundle); default 0; governable via PROP_TYPE_UPDATE_SWING_SIZING
+        sint64 swingBuyDipPct;     // Cloak buy-dip threshold: buy when 1-wk avg <= 3-mo avg - this%; default 30; governable via PROP_TYPE_UPDATE_SWING_DIP
+        sint64 swingSellGainPct;   // Cloak rally-sell threshold: sell when price >= cost x (100+this)%; default 6; governable via PROP_TYPE_UPDATE_SWING_RALLY
         uint32 breakoutRescanTicks;// Dagger: re-scan pace (ticks) while a pool is in a VIX breakout; default 1200 (5 min); governable via PROP_TYPE_UPDATE_BREAKOUT_RESCAN
         uint32 qxTransferFee;      // cached QX share-transfer fee (QU). Bootstrapped to QX's constant (100 since
                                    // epoch 138) and refreshed live whenever the reserve-liquidation path queries
@@ -799,6 +832,9 @@ struct CLKnDGR : public ContractBase
         state.mut().swingSellPct           = INITIAL_SWING_SELL_PCT;     // 50%; governable via PROP_TYPE_UPDATE_SWING_SELL_PCT
         state.mut().stopLossTriggerPct     = INITIAL_STOP_LOSS_TRIGGER_PCT; // 45% below avg cost; 0 disables; governable via PROP_TYPE_UPDATE_STOP_LOSS_TRIGGER
         state.mut().stopLossSellPct        = INITIAL_STOP_LOSS_SELL_PCT;    // sell 60% of the bag per trigger; governable via PROP_TYPE_UPDATE_STOP_LOSS_SELL
+        state.mut().swingSizingPreset      = 0;                          // preset 0 = 1% first / 0.25% add / 5% cap; governable via PROP_TYPE_UPDATE_SWING_SIZING
+        state.mut().swingBuyDipPct         = (sint64)SWING_BUY_DIP_PCT;  // 30% below 3-month avg; governable via PROP_TYPE_UPDATE_SWING_DIP
+        state.mut().swingSellGainPct       = (sint64)SWING_SELL_GAIN_PCT; // 6% above cost; governable via PROP_TYPE_UPDATE_SWING_RALLY
         state.mut().breakoutRescanTicks    = COOLDOWN_TICKS_BREAKOUT;    // 1200 ticks (5 min); governable via PROP_TYPE_UPDATE_BREAKOUT_RESCAN
         state.mut().qxTransferFee          = INITIAL_QX_TRANSFER_FEE;    // 100 QU bootstrap; refreshed live from QX during reserve liquidation
     }
@@ -897,29 +933,41 @@ struct CLKnDGR : public ContractBase
             locals.activeCcfPct     = PAYOUT0_CCF_PCT;
         }
 
-        // Pre-compute this epoch's Qearn allocation so it can be excluded from the NAV below.
-        // The Qearn slice is donated to Qearn's bonus pool — a permanent outflow — so it is never
-        // depositor trading capital and must not inflate the vault NAV.
-        // Uses pre-auto-payout epochProfit; the profit split recomputes from the final value.
+        // Pre-compute this epoch's payout slices so they can be excluded from the NAV below. EVERY slice the
+        // profit split sends away from depositor trading capital — Qearn donation, dev fund (->quReserve),
+        // exec-fee burn, shareholder dividend, CCF — must be excluded, or the vault NAV grows on profit that
+        // leaves the contract and the share price over-states the depositor pool above the QU that backs it.
+        // Uses pre-auto-payout epochProfit; the profit split recomputes from the final value (the perf-fee
+        // delta added during auto-payout is second-order — same approximation the Qearn exclusion already made).
         locals.qearnDonateAmt = 0;
+        locals.devFundAmt = 0; locals.execFeeAmt = 0; locals.distribAmount = 0; locals.ccfAmt = 0;
         if (state.get().epochProfit > 0)
         {
-            locals.qearnDonateAmt = div((uint64)state.get().epochProfit * locals.activeQearnPct, (uint64)100);
+            locals.qearnDonateAmt = div((uint64)state.get().epochProfit * locals.activeQearnPct,   (uint64)100);
+            locals.devFundAmt     = div((uint64)state.get().epochProfit * locals.activeDevFundPct,  (uint64)100);
+            locals.execFeeAmt     = div((uint64)state.get().epochProfit * locals.activeExecFeePct,  (uint64)100);
+            locals.distribAmount  = div((uint64)state.get().epochProfit * locals.activeDistPct,     (uint64)100);
+            locals.ccfAmt         = div((uint64)state.get().epochProfit * locals.activeCcfPct,      (uint64)100);
         }
 
-        // --- Vault NAV update (before profit split; donated Qearn allocation excluded — not depositor capital) ---
+        // --- Vault NAV update (before profit split; ALL payout slices excluded — not depositor capital) ---
         if (state.get().totalVaultShares > 0 && state.get().prevTradingBalance > 0)
         {
-            // Exclude quReserve, accumulated qearnReserve, this epoch's Qearn allocation,
-            // waitlistQu, and reserveSellProceeds — none of these represent trading P&L for
-            // active depositors. reserveSellProceeds are last epoch's reserve-sell QU sitting
-            // in contractBalance pending the profit split; excluding them prevents the vault
-            // NAV from being inflated by proceeds that will be distributed (not kept) this epoch.
+            // Exclude quReserve, accumulated qearnReserve, waitlistQu, reserveSellProceeds, AND this epoch's
+            // payout slices (Qearn + dev + exec + dividend + CCF). None of these is retained trading capital
+            // for active depositors, so none may lift the share price. The payout slices are subtracted here
+            // (before the split actually pays them out) so the NAV grows ONLY on the retained remainder;
+            // omitting them over-credits depositors by that amount every profit epoch (proven by the
+            // NAV_DepositorPoolStaysBackedAcrossProfitEpoch test — full profit in limp mode, ~42% on preset 0).
             qpi.getEntity(SELF, locals.entity);
             locals.vaultCurBalance = (sint64)(locals.entity.incomingAmount - locals.entity.outgoingAmount)
                                      - state.get().quReserve
                                      - state.get().qearnReserve
                                      - (sint64)locals.qearnDonateAmt
+                                     - (sint64)locals.devFundAmt
+                                     - (sint64)locals.execFeeAmt
+                                     - (sint64)locals.distribAmount
+                                     - (sint64)locals.ccfAmt
                                      - state.get().waitlistQu
                                      - state.get().reserveSellProceeds;
             if (locals.vaultCurBalance > 0)
@@ -1700,6 +1748,29 @@ struct CLKnDGR : public ContractBase
                         state.mut().stopLossSellPct = locals.prop.newValue;
                     }
                 }
+                else if (locals.prop.proposalType == PROP_TYPE_UPDATE_SWING_SIZING)
+                {
+                    if (locals.prop.newValue >= 0LL && locals.prop.newValue <= 3LL)
+                    {
+                        state.mut().swingSizingPreset = (uint8)locals.prop.newValue;
+                    }
+                }
+                else if (locals.prop.proposalType == PROP_TYPE_UPDATE_SWING_DIP)
+                {
+                    if (locals.prop.newValue == 5LL  || locals.prop.newValue == 10LL || locals.prop.newValue == 15LL ||
+                        locals.prop.newValue == 20LL || locals.prop.newValue == 25LL || locals.prop.newValue == 30LL)
+                    {
+                        state.mut().swingBuyDipPct = locals.prop.newValue;
+                    }
+                }
+                else if (locals.prop.proposalType == PROP_TYPE_UPDATE_SWING_RALLY)
+                {
+                    if (locals.prop.newValue == 6LL  || locals.prop.newValue == 12LL || locals.prop.newValue == 18LL ||
+                        locals.prop.newValue == 24LL || locals.prop.newValue == 30LL)
+                    {
+                        state.mut().swingSellGainPct = locals.prop.newValue;
+                    }
+                }
                 else if (locals.prop.proposalType == PROP_TYPE_WITHDRAW_ASSET_RESERVE)
                 {
                     if (locals.prop.poolIndex < (uint64)state.get().poolCount &&
@@ -2118,7 +2189,7 @@ struct CLKnDGR : public ContractBase
             // EC-C12: subtractive form (× SWING_BUY_DIP_PCT) avoids the × (100 - dip) overflow class.
             locals.swingIsDip = (locals.swingThreeMonthAvg > 0 && locals.swingOneWeekPrice > 0 &&
                 locals.swingOneWeekPrice <= locals.swingThreeMonthAvg -
-                    (sint64)div((uint64)locals.swingThreeMonthAvg * (uint64)SWING_BUY_DIP_PCT, (uint64)100))
+                    (sint64)div((uint64)locals.swingThreeMonthAvg * (uint64)state.get().swingBuyDipPct, (uint64)100))
                 ? 1 : 0;
 
             locals.swingBuyQu = 0; // set below to 1% (first buy) or 0.25% (DCA-in add) if we decide to buy
@@ -2148,7 +2219,7 @@ struct CLKnDGR : public ContractBase
                 // Sell trigger: pool price >= cost per token × 112%
                 // EC-C7: additive form avoids × 112 overflow (same class as EC-3)
                 if (locals.swingPoolPrice >= locals.swingCostPerToken +
-                        (sint64)div((uint64)locals.swingCostPerToken * (uint64)SWING_SELL_GAIN_PCT, (uint64)100))
+                        (sint64)div((uint64)locals.swingCostPerToken * (uint64)state.get().swingSellGainPct, (uint64)100))
                 {
                     locals.swingSellAmt = (sint64)div(
                         (uint64)state.get().swingTokens.get(locals.i) * (uint64)state.get().swingSellPct,
@@ -2448,9 +2519,9 @@ struct CLKnDGR : public ContractBase
                 if (locals.swingIsDip
                     && locals.tradingBalance >= state.get().minProfitQu
                     && state.get().swingCostBasis.get(locals.i) <
-                        (sint64)div((uint64)locals.tradingBalance * (uint64)MAX_SWING_POSITION_PCT, (uint64)100))
+                        (sint64)div((uint64)locals.tradingBalance * swingCapBpsForPreset(state.get().swingSizingPreset), (uint64)10000))
                 {
-                    locals.swingBuyQu = (sint64)div((uint64)locals.tradingBalance, (uint64)SWING_DCA_ADD_DIVISOR); // 0.25% add
+                    locals.swingBuyQu = (sint64)div((uint64)locals.tradingBalance, swingAddDivisorForPreset(state.get().swingSizingPreset)); // DCA add (0.25% or 0.50% per preset)
                 }
             }
 
@@ -2465,8 +2536,8 @@ struct CLKnDGR : public ContractBase
                 && locals.tradingBalance >= state.get().minProfitQu)
             {
                 locals.swingBuyQu = (sint64)div(
-                    (uint64)locals.tradingBalance * (uint64)SWING_BUY_CAPITAL_PCT,
-                    (uint64)100); // 1% first buy
+                    (uint64)locals.tradingBalance * swingFirstBuyPctForPreset(state.get().swingSizingPreset),
+                    (uint64)100); // first buy (1%/2%/3% per preset)
             }
 
             if (locals.swingBuyQu <= 0 || locals.swingBuyQu + QSWAP_ADDITIONAL_FEE > locals.tradingBalance) { continue; } // nothing to buy (incl. Qswap swap fee)
@@ -3104,7 +3175,7 @@ struct CLKnDGR : public ContractBase
 
         // Validate proposal type — full refund on rejection (mirrors the insufficient-fee path below).
         if (input.proposalType < PROP_TYPE_ADD_POOL ||
-            input.proposalType > PROP_TYPE_UPDATE_STOP_LOSS_SELL)
+            input.proposalType > PROP_TYPE_UPDATE_SWING_RALLY)
         {
             if (qpi.invocationReward() > 0) { qpi.transfer(qpi.invocator(), qpi.invocationReward()); }
             return;
@@ -3295,6 +3366,23 @@ struct CLKnDGR : public ContractBase
             // % of a losing bag sold per stop-loss trigger: a 15-point step, 15..90.
             if (input.newValue != 15LL && input.newValue != 30LL && input.newValue != 45LL &&
                 input.newValue != 60LL && input.newValue != 75LL && input.newValue != 90LL) { locals.contentValid = 0; }
+        }
+        if (locals.contentValid && input.proposalType == PROP_TYPE_UPDATE_SWING_SIZING)
+        {
+            // Cloak position-sizing preset: bundle index 0..3 (first-buy / DCA-add / cap).
+            if (input.newValue < 0 || input.newValue > 3) { locals.contentValid = 0; }
+        }
+        if (locals.contentValid && input.proposalType == PROP_TYPE_UPDATE_SWING_DIP)
+        {
+            // Cloak buy-dip threshold (% below 3-month avg): a 5-point step, 5..30.
+            if (input.newValue != 5LL  && input.newValue != 10LL && input.newValue != 15LL &&
+                input.newValue != 20LL && input.newValue != 25LL && input.newValue != 30LL) { locals.contentValid = 0; }
+        }
+        if (locals.contentValid && input.proposalType == PROP_TYPE_UPDATE_SWING_RALLY)
+        {
+            // Cloak rally-sell threshold (% above cost per token): a 6-point step, 6..30.
+            if (input.newValue != 6LL  && input.newValue != 12LL && input.newValue != 18LL &&
+                input.newValue != 24LL && input.newValue != 30LL) { locals.contentValid = 0; }
         }
 
         // Reject duplicate proposals: prevent two conflicting proposals of the same type in one epoch.
@@ -3523,6 +3611,9 @@ struct CLKnDGR : public ContractBase
         output.stopLossSellPct            = state.get().stopLossSellPct;
         output.breakoutRescanTicks        = state.get().breakoutRescanTicks;
         output.qxFeeLivePerTrade          = state.get().qxFeeLivePerTrade;
+        output.swingSizingPreset          = state.get().swingSizingPreset;
+        output.swingBuyDipPct             = state.get().swingBuyDipPct;
+        output.swingSellGainPct           = state.get().swingSellGainPct;
         output.inLimpMode                 = state.get().inLimpMode;
     }
 
