@@ -83,7 +83,7 @@ The Cloak is a medium-term swing trading strategy. It watches for meaningful pri
 
 **Entry condition:** The current 1-week average price for a pool has fallen to **≤ 90% of the 3-month average price** — a statistically significant dip relative to recent history.
 
-**On entry & accumulation (DCA-in):** The first buy on a fresh dip uses **1% of trading capital**. If the dip is still present at later monthly checks, it **adds 0.25% more** each time — averaging down — **until the position's cost basis reaches 5% of capital**. That cap re-opens automatically as the fund grows or as the position is sold down. All buys use up to 5% slippage tolerance.
+**On entry & accumulation (DCA-in):** The first buy on a fresh dip uses **1% of trading capital**. If the dip is still present at later monthly checks, it **adds 0.25% more** each time — averaging down — **until the position's cost basis reaches 5% of capital**. That cap re-opens automatically as the fund grows or as the position is sold down. All buys use up to 5% slippage tolerance. *(That 1% / 0.25% / 5% bundle is the default **position-sizing preset**, governable via Type 26. The price drop that defines "a dip" defaults to **30% below the 3-month average** (Type 27), and the profit level that starts selling defaults to **6% above cost** (Type 28) — all three are governable.)*
 
 **Exit condition:** The current Qswap pool price is **≥ 112% of the average cost paid** for the held position.
 
@@ -186,13 +186,13 @@ voted on by the shareholder group. A proposal passes when:
 1. A minimum number of unique voters participate (default: 15)
 2. A minimum total weighted share count has voted
 3. At least 2/3 of weighted votes are Yes (supermajority)
-4. Fewer than 125 qualifying depositor NO votes have been cast (depositor veto)
+4. Fewer than 500 qualifying depositor NO votes have been cast (depositor veto)
 
 The depositor veto exists specifically so that large depositors cannot be harmed by governance
 decisions without a meaningful check. Veto votes are re-validated at epoch end against the
 current NAV — a depositor who has lost significant value no longer qualifies.
 
-### Governable parameters (23 proposal types)
+### Governable parameters (28 proposal types)
 
 | # | Proposal | Fee | What it changes |
 |---|---|---|---|
@@ -216,11 +216,14 @@ current NAV — a depositor who has lost significant value no longer qualifies.
 | 18 | **UPDATE_VIX_FACTOR** | 50M QU | Tunes the Dagger's volatility-breakout sensitivity — how far a token's recent (≈5-day) volatility must rise above its own (≈4-week) baseline before the Dagger starts hunting it. Stored ×100. Options (multiplier of the token's own baseline): 0.09, 0.18, 0.37, 0.75, 1.5, 2 (default), 2.25, 2.75, 3.5, 4.5, 5 — submitted as 9 / 18 / 37 / 75 / 150 / 200 / 225 / 275 / 350 / 450 / 500. Below 1× the Dagger hunts almost always (the floor becomes the gate); higher = more selective. |
 | 19 | **UPDATE_VIX_FLOOR** | 50M QU | Minimum absolute recent volatility (in basis points) for a token to count as "breaking out" — keeps a near-dead token from triggering on a tiny wiggle. Options: 0 (ratio-only), 10, 25 (default), 50, 100, 200 bps. |
 | 20 | **UPDATE_VIX_PULSE_RATE** | 50M QU | How many times a day the Dagger samples each pool's price to update its volatility reading. Options: **1 (default)**, 2, or 3 per day. More = sharper/faster detection but more fee cost; fewer = cheaper but slower to notice a token heating up. The 5-day/4-week volatility horizons stay fixed regardless — only the sampling frequency changes. |
-| 21 | **UPDATE_SWING_SELL_PCT** | 50M QU | The Cloak's sell chunk — what % of a held bag it sells each time the +12% profit trigger fires. Options: 10, 15, 20, 25, 33, **50 (default)**. Higher = takes profit faster; lower = rides winners longer. |
+| 21 | **UPDATE_SWING_SELL_PCT** | 50M QU | The Cloak's sell chunk — what % of a held bag it sells each time the rally-sell trigger (Type 28) fires. Options: 10, 15, 20, 25, 33, **50 (default)**. Higher = takes profit faster; lower = rides winners longer. |
 | 22 | **UPDATE_BREAKOUT_RESCAN** | 50M QU | How often the Dagger re-checks a hot (breaking-out) pool while it looks for a gap (it still trades every tick once a real gap is found — this only paces the empty looks). Submitted in seconds: 30, 60, 120, 180, 240, **300 (default = 5 min)**. Shorter = catches fast gaps but costs more; longer = cheaper. |
 | 23 | **UPDATE_QX_FEE_MODE** | 50M QU | How the contract sources QX's share-transfer fee for its sell orders. **0 (default)** = per-epoch cached value (cheapest; QX's fee is a fixed 100 QU today). **1** = fetch live from QX before every sell. A forward-looking, **one-way** switch: if QX ever makes its fee tick-variable, shareholders flip this to 1 (no re-deploy). **Permanent once enabled** — it can never be switched back. |
 | 24 | **UPDATE_STOP_LOSS_TRIGGER** | 50M QU | The Cloak's **stop-loss depth** — how far a held bag must fall **below its average cost** before the contract starts cutting it. **0 = disabled.** Otherwise a 15-point step: 15, 30, **45 (default)**, 60, 75, 90 (%). Lower = cut shallow losers fast (less patient); higher = give a dip more room to recover before cutting. |
 | 25 | **UPDATE_STOP_LOSS_SELL** | 50M QU | How much of a losing bag the stop-loss sells **each time it triggers** — it scales out, never dumping the whole bag at once. A 15-point step: 15, 30, 45, **60 (default)**, 75, 90 (%). At the Cloak's ~monthly cadence a dying bag bleeds down over a few cuts while a recovering one keeps the rest. |
+| 26 | **UPDATE_SWING_SIZING** | 50M QU | The Cloak's **position-sizing preset** — bundles the first-buy size, the DCA-in add size, and the per-token cost cap into one setting. Options: **0 (default)** = 1% / 0.25% / 5%; 1 = 1% / 0.25% / 7.5%; 2 = 2% / 0.50% / 10%; 3 = 3% / 0.25% / 15%. Higher = deploys capital faster and allows bigger single-token positions. |
+| 27 | **UPDATE_SWING_DIP** | 50M QU | The Cloak's **buy-dip threshold** — how far the 1-week average must fall below the 3-month average before a pool counts as "in a dip" and the Cloak buys. A 5-point step: 5, 10, 15, 20, 25, **30 (default)** (%). Larger = more patient (only buys deeper dips). |
+| 28 | **UPDATE_SWING_RALLY** | 50M QU | The Cloak's **rally-sell threshold** — how far the price must rise above the position's average cost before the Cloak starts selling (scaling out by the Type 21 sell chunk). A 6-point step: **6 (default)**, 12, 18, 24, 30 (%). Smaller = takes profit sooner. |
 
 **What happens to the fee:** every proposal fee funds the contract's **execution-fee reserve** — none is burned from supply, and none is kept as trading capital.
 
@@ -261,7 +264,7 @@ community input on:
 
 1. **Profit split presets** — do the three options cover the range of preferences, or is something missing?
 2. **Vault mechanics** — is the 26-epoch lock + early exit penalty the right trade-off? Too long? Too short?
-3. **Depositor veto threshold** — 125 out of up to 5,000 depositors, with a minimum locked QU. Too easy to veto? Too hard?
+3. **Depositor veto threshold** — 500 out of up to 5,000 depositors, with a minimum locked QU. Too easy to veto? Too hard?
 4. **Donations** — does routing 100% of a donation to the contract's execution-fee reserve (keeping it funded to run) feel right, or should donations do something else?
 5. **Pool governance fees** — ADD_POOL costs 200M QU. Is this an appropriate barrier to prevent spam pools?
 6. **Any other comment or concern**
