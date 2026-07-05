@@ -1,3 +1,4 @@
+🇬🇧 **English** (this document) · 🇷🇴 [Română](Cloak-and-Dagger-README-RO.md)
 CLKnDGR-Readme
 Subtle explanation of the contract I am working on. - Misfitcompany K.I.R | D.O.M
 
