@@ -194,7 +194,7 @@ epoch end (so the reserve keeps only the 31%).
 ```cpp
 struct SubmitProposal_input
 {
-    uint8  proposalType;    // proposal type constant (1–23)
+    uint8  proposalType;    // proposal type constant (1–33)
     uint64 assetName;       // ADD_POOL only; 0 otherwise
     id     assetIssuer;     // ADD_POOL only; NULL_ID otherwise
     uint64 poolIndex;       // pool-indexed types only; 0 otherwise
@@ -350,11 +350,12 @@ Switch the epoch profit distribution preset.
 | 0 (default) | 55% | 30% | 3% | 10% | 1% | 1% |
 | 1 | 61% | 27% | 3% | 7% | 1% | 1% |
 | 2 | 65% | 25% | 3% | 5% | 1% | 1% |
-| 3 (recovery) | 0% | 100% | 0% | 0% | 0% | 0% |
+| 3 (recovery) | 30% | 70% | 0% | 0% | 0% | 0% |
 
-Preset 3 is the **recovery / limp-mode** split: 100% of profit refills the execution-fee reserve and all
-other payouts are suspended, while the contract keeps trading normally. It is **auto-applied** whenever
-the fee reserve drops below `execReserveFloor` (see Type 16), and can also be selected manually here.
+Preset 3 is the **recovery / limp-mode** split: 70% of profit refills the execution-fee reserve and the
+retained **30% still credits depositors** (their vault NAV keeps growing); the shareholder / Qearn /
+dev-fund / CCF payouts are suspended, while the contract keeps trading normally. It is **auto-applied**
+whenever the fee reserve drops below `execReserveFloor` (see Type 16), and can also be selected manually here.
 
 **Format string:**
 ```
@@ -517,8 +518,9 @@ Change the minimum additional QU required when a depositor re-locks their vault 
 #### Type 16 — UPDATE_EXEC_RESERVE_FLOOR
 
 Sets the **execution-fee-reserve safety floor**. When the contract's execution-fee reserve falls below
-this value, the epoch profit split automatically switches to the recovery preset (3) — routing **100% of
-profit** into the reserve and suspending the shareholder / Qearn / dev-fund / CCF payouts — while the
+this value, the epoch profit split automatically switches to the recovery preset (3) — routing **70% of
+profit** into the reserve (the retained **30% still credits depositors**) and suspending the shareholder /
+Qearn / dev-fund / CCF payouts — while the
 contract **keeps trading normally** to earn that profit. It returns to the chosen preset **once the
 reserve climbs back to 10% above this floor** (a hysteresis buffer that prevents rapid on/off flapping).
 This lets the contract rebuild its on-chain fee budget from its own earnings when network execution fees
@@ -577,9 +579,10 @@ and can be re-proposed.)
 #### Type 18 — UPDATE_VIX_FACTOR
 
 Tunes the Dagger's **volatility-breakout sensitivity**. The Dagger only scans a pool for arbitrage when
-that token's recent (~5-day) volatility rises above its own (~4-week) baseline by this multiplier. A
-lower value makes the Dagger more eager (scans sooner, spends more execution fees); a higher value makes
-it more selective. Stored ×100 (200 = 2.00×).
+that token's recent fast-horizon (default 2-day, governable via Type 30) volatility rises above its own
+slow-horizon (default 1-week, governable via Type 31) baseline by this multiplier. A lower value makes
+the Dagger more eager (scans sooner, spends more execution fees); a higher value makes it more selective.
+Stored ×100 (200 = 2.00×).
 
 **Fee:** 50,000,000 QU
 
@@ -636,8 +639,9 @@ large *ratio* over an even tinier baseline — from waking the Dagger. `0` disab
 
 Sets **how many times per day** the VIX sampler reads each pool's price to update its volatility
 reading. More pulses = sharper, faster detection of a token heating up, but more execution-fee cost;
-fewer = cheaper but slower to react. The ≈5-day / ≈4-week volatility horizons stay fixed regardless —
-only the sampling frequency changes (the averaging auto-scales with the rate).
+fewer = cheaper but slower to react. The volatility **horizons** (fast/slow) are separate governable
+levers (Types 30/31), held in days, so they stay fixed when the pulse rate changes — only the sampling
+frequency changes here (the averaging auto-scales with the rate).
 
 **Fee:** 50,000,000 QU
 
@@ -871,6 +875,124 @@ sooner.
 "28uint8, 0uint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid, 0uint64, <newValue>sint64, 0sint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid"
 ```
 
+#### Type 29 — DELETE_POOL
+
+**Permanently frees a pool's slot** and removes it from the every-tick scan. This is the last step of a
+deliberate multi-vote retirement flow: **deactivate (Type 2) → withdraw everything (Types 11 / 17) → delete**.
+It moves no funds itself; all fund-handling happens in the prior votes, so delete only reclaims an
+already-safe, empty slot.
+
+**Fee:** 50,000,000 QU
+
+**Uses `poolIndex`** (not `newValue`).
+
+**Validation (guard).** The target pool must ALREADY be:
+1. **deactivated** (via REMOVE_POOL, Type 2), and
+2. **fully emptied** — no reserve tokens, no open Cloak/swing position, and nothing pending in Dagger or
+   Cloak recovery (withdraw/sell first via WITHDRAW_ASSET_RESERVE / SELL_POOL_TOKENS).
+
+If any of those is non-zero the proposal is **rejected at submission** (content-invalid, standard refund).
+At epoch end the slot is reclaimed by **swap-and-shrink**: the highest-indexed live pool moves into the
+freed slot and `poolCount` drops by one. Deletion is **irreversible and re-indexes pools** (any other pool
+sitting at the last index takes the deleted pool's index) — but the asset can be **re-added later** via
+ADD_POOL (Type 1) as a brand-new pool, since the freed name is available again.
+
+**Format string:**
+```
+"29uint8, 0uint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid, <poolIndex>uint64, 0sint64, 0sint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid"
+```
+
+#### Type 30 — UPDATE_VIX_FAST_DAYS
+
+Sets the **fast VIX EWMA horizon** in days — the short window whose average volatility is compared against
+the slow baseline (Type 31) to detect a breakout. Smaller = more reactive (fires on shorter bursts). The
+horizon is a **time** in days and is independent of the pulse rate (Type 20): the EWMA divisor is
+`days × pulses/day`, so changing the pulse rate does not move the horizon.
+
+**Fee:** 50,000,000 QU
+
+**Validation:** `newValue` must be one of 2, 3, 4, 5.
+
+| newValue | Fast horizon |
+|---|---|
+| 2 (default) | 2 days |
+| 3 | 3 days |
+| 4 | 4 days |
+| 5 | 5 days |
+
+**Format string:**
+```
+"30uint8, 0uint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid, 0uint64, <newValue>sint64, 0sint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid"
+```
+
+#### Type 31 — UPDATE_VIX_SLOW_WEEKS
+
+Sets the **slow VIX EWMA baseline** in weeks — the long window the fast horizon (Type 30) is measured
+against. Submitted in **weeks**, stored internally as `weeks × 7` days. Larger = a calmer, slower-moving
+baseline (a breakout must clear a longer-run norm).
+
+**Fee:** 50,000,000 QU
+
+**Validation:** `newValue` must be one of 1, 2, 3, 4 (weeks).
+
+| newValue | Slow baseline |
+|---|---|
+| 1 (default) | 1 week (7 days) |
+| 2 | 2 weeks (14 days) |
+| 3 | 3 weeks (21 days) |
+| 4 | 4 weeks (28 days) |
+
+**Format string:**
+```
+"31uint8, 0uint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid, 0uint64, <newValue>sint64, 0sint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid"
+```
+
+#### Type 32 — UPDATE_SWING_CADENCE
+
+Sets the **Cloak per-pool check cadence** in days — how often each pool is re-evaluated for a Cloak
+buy/sell action (the shared per-pool cooldown between actions). Default is ~monthly. Smaller = the Cloak
+revisits each pool more often (more responsive, but more execution-fee activity).
+
+**Fee:** 50,000,000 QU
+
+**Validation:** `newValue` must be one of 5, 10, 20, 30 (days).
+
+| newValue | Cadence |
+|---|---|
+| 30 (default) | ~monthly |
+| 20 | every 20 days |
+| 10 | every 10 days |
+| 5 | every 5 days |
+
+**Format string:**
+```
+"32uint8, 0uint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid, 0uint64, <newValue>sint64, 0sint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid"
+```
+
+#### Type 33 — UPDATE_TICKRATE_PIN
+
+**Emergency seatbelt for the self-healing tick rate.** CLKnDGR normally measures the real network tick
+speed off the consensus clock and keeps a live `dayTicks` that all duration timers scale from (cadences,
+cooldowns, VIX sampling) — so a change in the network's ticks/sec never drifts the contract's real-world
+timing and never needs a redeploy. This proposal is the manual override for the rare case where the
+auto-tuner misbehaves.
+
+**Fee:** 50,000,000 QU
+
+**Validation:** `newValue` must be **0** or in **1..40**.
+
+| newValue | Effect |
+|---|---|
+| 0 (default) | **Auto / self-heal** — resume live measurement (also re-anchors calibration cleanly) |
+| 1..40 | **Pin** `dayTicks` to `newValue × 86400` (i.e. `newValue` ticks/sec) and freeze auto-calibration |
+
+Values outside 0..40 are content-invalid (the accepted 1–40 ticks/sec band matches the auto-tuner's clamp).
+
+**Format string:**
+```
+"33uint8, 0uint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid, 0uint64, <newValue>sint64, 0sint64, AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAid"
+```
+
 ---
 
 ### Consensus requirements
@@ -948,7 +1070,7 @@ Returns the full state of one governance proposal slot (0–9) for the current e
 
 | Field | Type | Description |
 |---|---|---|
-| `proposalType` | uint8 | Proposal type 1–23 (0 if the slot is empty) |
+| `proposalType` | uint8 | Proposal type 1–33 (0 if the slot is empty) |
 | `status` | uint8 | 0 = empty, 1 = active (awaiting epoch-end tally), 2 = passed, 3 = failed |
 | `proposer` | id | Address that submitted the proposal |
 | `assetName` | uint64 | Target pool token name (ADD_POOL) |
@@ -972,7 +1094,7 @@ Returns all governable parameters in a single call. No input required.
 ```
 ./qubic-cli -nodeip NODE_IP -nodeport NODE_PORT \
   -callcontractfunction CONTRACT_INDEX 4 "" \
-  "sint64,sint64,sint64,sint64,uint8,uint16,uint8,uint8,sint64,sint64,sint64,uint8,sint64,sint64,uint32,sint64,uint32,uint8"
+  "sint64,sint64,sint64,sint64,uint8,uint16,uint8,uint8,sint64,sint64,sint64,uint8,sint64,sint64,uint32,sint64,sint64,sint64,uint32,uint8,uint8,sint64,sint64"
 ```
 
 **Output fields in order:**
@@ -989,8 +1111,8 @@ Returns all governable parameters in a single call. No input required.
 | `minReserveProfitPct` | uint8 | Min % profit required before selling reserve tokens |
 | `depositorVoteMinQu` | sint64 | Min locked QU for a depositor veto vote to qualify |
 | `relockAddAmount` | sint64 | Min additional QU required to re-lock a vault position |
-| `execReserveFloor` | sint64 | Execution-fee-reserve safety floor; when the reserve drops below this, all profit is routed to the fee reserve (recovery preset) until it refills (0 = disabled) |
-| `inLimpMode` | uint8 | 1 if currently in recovery/limp mode (100% of profit routed to the fee reserve; the contract keeps trading); returns to 0 once the reserve reaches 10% above the floor |
+| `execReserveFloor` | sint64 | Execution-fee-reserve safety floor; when the reserve drops below this, 70% of profit is routed to the fee reserve (recovery preset; the other 30% is retained as depositor trading capital) until it refills (0 = disabled) |
+| `inLimpMode` | uint8 | 1 if currently in recovery/limp mode (70% of profit routed to the fee reserve, 30% retained for depositors; the contract keeps trading); returns to 0 once the reserve reaches 10% above the floor |
 | `vixBreakoutFactor` | sint64 | VIX breakout sensitivity ×100 (200 = 2.00×): how far a token's recent volatility must exceed its own baseline to wake the Dagger |
 | `vixAbsFloorBps` | sint64 | Minimum absolute recent volatility (basis points) for a breakout to count |
 | `vixSampleInterval` | uint32 | Ticks between VIX price samples (345600 = 1/day, 172800 = 2/day, 115200 = 3/day) |
@@ -1185,7 +1307,7 @@ the threshold (due to NAV changes) between the time you voted and epoch end, you
 ```
 ./qubic-cli -nodeip NODE_IP -nodeport NODE_PORT \
   -callcontractfunction CONTRACT_INDEX 4 "" \
-  "sint64,sint64,sint64,sint64,uint8,uint16,uint8,uint8,sint64,sint64,sint64,uint8,sint64,sint64,uint32,sint64,uint32,uint8"
+  "sint64,sint64,sint64,sint64,uint8,uint16,uint8,uint8,sint64,sint64,sint64,uint8,sint64,sint64,uint32,sint64,sint64,sint64,uint32,uint8,uint8,sint64,sint64"
 ```
 
 The 9th field is `depositorVoteMinQu`. Confirm your locked QU exceeds it.
@@ -1286,7 +1408,7 @@ the relevant function directly:
 ```
 ./qubic-cli -nodeip NODE_IP -nodeport NODE_PORT \
   -callcontractfunction CONTRACT_INDEX 4 "" \
-  "sint64,sint64,sint64,sint64,uint8,uint16,uint8,uint8,sint64,sint64,sint64,uint8,sint64,sint64,uint32,sint64,uint32,uint8"
+  "sint64,sint64,sint64,sint64,uint8,uint16,uint8,uint8,sint64,sint64,sint64,uint8,sint64,sint64,uint32,sint64,sint64,sint64,uint32,uint8,uint8,sint64,sint64"
 ```
 
 ---

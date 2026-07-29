@@ -1,14 +1,16 @@
 # CLKnDGR (Cloak & Dagger) — Complete Contract Breakdown
 
-> Reference document. **Generated 2026-06-12; fully resynced 2026-06-24** against the current
-> contract source (`src/contracts/CLKnDGR.h`),
-> `Cloak-and-Dagger-README.md`, and `CLOAKandDAGGER-ABI.md`.
+> Reference document. **Generated 2026-06-12; fully resynced 2026-07-28** against the current
+> contract source (`src/contracts/CLKnDGR.h`), `Cloak-and-Dagger-README.md`, and
+> `CLOAKandDAGGER-ABI.md` — after the 33-proposal-type governance set (pool deletion, governable VIX
+> horizons + Cloak cadence, and the self-healing tick rate), the 30/70 recovery split, and a full
+> doc/comment audit.
 >
-> **Source of truth:** Where the README and ABI disagree (notably the profit-split preset
-> percentages), the **contract source wins**. The preset table below uses the source values.
-> Container capacities shown (1024 / 8192 / 4096 / 16 / 512) are the power-of-2 sizes set during
-> the QPI refactor; the *logical* limits (676 voters, 5,000 depositors, 500 waitlist,
-> 10 proposals) are unchanged.
+> **Source of truth:** if any doc ever disagrees with the contract source, the **contract source wins**.
+> As of this resync the source, README, ABI, and this breakdown are **reconciled** — the profit-split
+> presets, the 33 proposal types, and the constants all match the source. Container capacities shown
+> (1024 / 8192 / 4096 / 16 / 512) are the power-of-2 sizes set during the QPI refactor; the *logical*
+> limits (676 voters, 5,000 depositors, 500 waitlist, 10 proposals) are unchanged.
 
 ---
 
@@ -60,8 +62,9 @@ Both run every tick, in order, sharing the same pool registry and capital base.
 - **Profit floor:** only fires if estimated net profit > `minProfitQu` (governable, default 100,100).
 - **VIX gate (cost control):** a cheap per-pool volatility index, sampled **1×/day** (governable 1–3),
   decides *when* to scan — the Dagger hunts every **5 minutes** during a volatility breakout and sleeps
-  to a **2-week** safety scan when the token is calm. Breakout = fast (~5-day) volatility ≥ slow
-  (~4-week) baseline × factor (default 2×) **and** ≥ an absolute floor (default 25 bps).
+  to a **2-week** safety scan when the token is calm. Breakout = fast (default 2-day, governable via
+  Type 30) volatility ≥ slow (default 1-week, governable via Type 31) baseline × factor (default 2×)
+  **and** ≥ an absolute floor (default 25 bps).
 - **Reserve accumulation:** keeps **10%** (`RESERVE_PCT`) of acquired tokens per pool as a reserve,
   sold later when profitable (above `minReserveProfitPct`).
 - **Capital scaling:** large gaps are sized *down* so one pool can't consume all capital in a tick.
@@ -89,7 +92,7 @@ on where they got stuck (Cloak and Dagger keep separate recovery state).
 
 | ID | Procedure | Sends | Purpose |
 |---|---|---|---|
-| 1 | `SubmitProposal` | 50M–200M QU | Submit a governance proposal (one of **28** types) |
+| 1 | `SubmitProposal` | 50M–200M QU | Submit a governance proposal (one of **33** types) |
 | 2 | `VoteOnProposal` | — | Shareholder votes Yes/No on a proposal slot (0–9) |
 | 3 | `VaultDeposit` | deposit amount | Join the vault (or get waitlisted if full) |
 | 4 | `DepositorVeto` | — | Depositor casts a veto (NO) vote |
@@ -99,9 +102,9 @@ on where they got stuck (Cloak and Dagger keep separate recovery state).
 | 8 | `DonateToContract` | **any positive amount** | Donation → **100% burned to the execution-fee reserve** |
 | 9 | `PublicDonate` | **any positive amount** | Identical to DonateToContract — **100% to the execution-fee reserve** |
 
-*(The ABI procedure table lists only the first 7; the source also registers the two donation
-procedures as IDs 8 and 9. Both now accept any amount and route 100% to the fee reserve — the old
-fixed amounts / trading-vs-Qearn splits were removed.)*
+*(The ABI procedure table lists all 9 procedures, including the two donation procedures at IDs 8 and 9.
+Both accept any amount and route 100% to the fee reserve — the old fixed amounts / trading-vs-Qearn
+splits were removed.)*
 
 ---
 
@@ -117,7 +120,7 @@ fixed amounts / trading-vs-Qearn splits were removed.)*
 
 ---
 
-## 7. Governance — the 28 proposal types
+## 7. Governance — the 33 proposal types
 
 **A proposal passes only if ALL four hold:**
 1. ≥15 unique qualified voters (governable, range 15–676)
@@ -147,7 +150,7 @@ the proposer at epoch end.
 | 13 | UPDATE_RESERVE_PROFIT_PCT | 50M | Reserve-sell profit threshold (2/5/7/10%) |
 | 14 | UPDATE_DEPOSITOR_VOTE_MIN | 50M | Min locked QU to veto (50M/150M/250M/350M) |
 | 15 | UPDATE_RELOCK_AMOUNT | 50M | Min QU to relock (1M/5M/10M/20M/25M/50M) |
-| 16 | UPDATE_EXEC_RESERVE_FLOOR | 50M | Fee-reserve safety floor; below it, 100% of profit → reserve (recovery) until refilled. 0 (off) / 1B / 5B / 10B / 20B |
+| 16 | UPDATE_EXEC_RESERVE_FLOOR | 50M | Fee-reserve safety floor; below it, 70% of profit → reserve (recovery; 30% still to depositors) until refilled. 0 (off) / 1B / 5B / 10B / 20B |
 | 17 | SELL_POOL_TOKENS | 50M | Market-sell 1–100% of a pool's tokens on Qswap → proceeds folded into the vault (benefits depositors + shareholders) |
 | 18 | UPDATE_VIX_FACTOR | 50M | Dagger VIX breakout sensitivity ×100 (default 200 = 2×); 9/18/37/75/150/200/225/275/350/450/500 |
 | 19 | UPDATE_VIX_FLOOR | 50M | VIX absolute floor in bps (default 25); 0/10/25/50/100/200 |
@@ -160,6 +163,11 @@ the proposer at epoch end.
 | 26 | UPDATE_SWING_SIZING | 50M | Cloak position-sizing preset (first-buy/DCA-add/cap bundle): **0**=1%/0.25%/5% · 1=1%/0.25%/7.5% · 2=2%/0.50%/10% · 3=3%/0.25%/15% |
 | 27 | UPDATE_SWING_DIP | 50M | Cloak buy-dip threshold, % below 3-month avg (default 30); 5/10/15/20/25/30 |
 | 28 | UPDATE_SWING_RALLY | 50M | Cloak rally-sell threshold, % above cost (default 6); 6/12/18/24/30 |
+| 29 | DELETE_POOL | 50M | Permanently free a **deactivated + fully-empty** pool's slot (swap-and-shrink at epoch end; leaves the every-tick scan). Guard: deactivate → withdraw/sell all → delete. Irreversible + re-indexes; re-addable later via ADD_POOL as a fresh pool. Uses `poolIndex` |
+| 30 | UPDATE_VIX_FAST_DAYS | 50M | Fast VIX EWMA horizon in **days** (default 2); 2/3/4/5. Pulse-rate-independent (divisor = days × pulses/day) |
+| 31 | UPDATE_VIX_SLOW_WEEKS | 50M | Slow VIX EWMA baseline in **weeks**, stored ×7 as days (default 1 wk = 7 d); 1/2/3/4 |
+| 32 | UPDATE_SWING_CADENCE | 50M | Cloak per-pool check cadence in **days** (default 30 ≈ monthly); 30/20/10/5 |
+| 33 | UPDATE_TICKRATE_PIN | 50M | **Emergency seatbelt** for the self-healing tick rate. `newValue` = **0** (auto/self-heal, default) or **1–40** = pin `dayTicks` to that many ticks/sec and freeze auto-calibration. Use only if the auto-tuner misbehaves. See §12 |
 
 ---
 
@@ -173,11 +181,12 @@ vault capital → benefits depositors via NAV).
 | **0 — Default** | 55% | 30% | 3% | 10% | 1% | 1% |
 | **1** | 61% | 27% | 3% | 7% | 1% | 1% |
 | **2** | 65% | 25% | 3% | 5% | 1% | 1% |
-| **3 — Recovery / limp** | 0% | **100%** | 0% | 0% | 0% | 0% |
+| **3 — Recovery / limp** | 30% | **70%** | 0% | 0% | 0% | 0% |
 
 Preset 3 (recovery) auto-engages when the execution-fee reserve falls below `execReserveFloor`, or is
-selectable manually via UPDATE_PAYOUT. In it the contract **keeps trading normally** but routes 100%
-of profit to the fee reserve until it refills to 10% above the floor (hysteresis latch). The old
+selectable manually via UPDATE_PAYOUT. In it the contract **keeps trading normally** and routes **70%**
+of profit to the fee reserve while **retaining 30% as depositor trading capital** (depositor NAV keeps
+growing through recovery) — until it refills to 10% above the floor (hysteresis latch). The old
 deflationary **burn** bucket has been removed (it was 0% in every preset).
 
 ---
@@ -202,15 +211,16 @@ deflationary **burn** bucket has been removed (it was 0% in every preset).
 breaking out, ≈2 weeks baseline when calm).
 
 **Vault:** 26-epoch lock · 4-epoch relock window · 2% mgmt fee · 5% perf fee · 38% early-exit
-penalty · 8 deposit tiers (1–1,000 min shares) · initial share price 10,000 QU.
+penalty · 9 deposit tiers (0–8; 1–1,000 min shares) · initial share price 10,000 QU.
 
 **Cloak:** 13 price slots (~3 months) · **buy dip 30%** (default) · **sell gain 6%** (default) ·
 **sell 50%/trigger** (default) · sizing preset **1% first / 0.25% add / 5% cap** (default) ·
 **stop-loss 45% trigger / 60% cut** (default; 90/10 capital/exec split) · 80% liquidity required ·
-10% ask discount · 5% buy slippage · ~30-day (monthly) cooldown.
+10% ask discount · 5% buy slippage · ~30-day (monthly) cooldown (governable 30/20/10/5 — Type 32).
 
-**VIX (Dagger gate):** sample 1×/day (default) · fast ~5-day / slow ~4-week volatility EWMAs ·
-breakout factor 2× (default) · absolute floor 25 bps (default) · hunt ≈5 min / baseline ≈2 weeks.
+**VIX (Dagger gate):** sample 1×/day (default) · fast 2-day / slow 1-week volatility EWMAs (both
+governable — Types 30/31; horizons held in days, pulse-rate-independent) · breakout factor 2× (default) ·
+absolute floor 25 bps (default) · hunt ≈5 min / baseline ≈2 weeks.
 
 **Governance:** 676 voter capacity · 15 initial min quorum · 222 min shares quorum · **500 depositor
 veto threshold** · 10 proposals/epoch max · 5,000 max depositors · 500 waitlist size · proposal fee
@@ -292,6 +302,7 @@ split 31% reserve (non-refundable) / 69% reserve-on-pass-or-refund-on-fail.
 | `swingPriceHead` / `swingPriceCount` | Array[256] | Rolling write pointer / samples taken |
 | `swingTokens` / `swingCostBasis` | Array[256] | Per-pool swing position + cost |
 | `swingCooldownTick` | Array[256] | Per-pool swing cooldown (~monthly) |
+| `swingCadenceDays` | uint32 | Cloak per-pool check cadence in days (Type 32; default 30 → cooldown = days × `dayTicks`, self-healing) |
 | `swingSellPct` | sint64 | Cloak sell chunk % (Type 21) |
 | `swingSizingPreset` | uint8 | Position-sizing preset 0–3 (Type 26) |
 | `swingBuyDipPct` | sint64 | Buy-dip threshold % (Type 27) |
@@ -305,8 +316,26 @@ split 31% reserve (non-refundable) / 69% reserve-on-pass-or-refund-on-fail.
 | `vixFast` / `vixSlow` / `vixLastPrice` | Array[256] | Per-pool fast/slow volatility EWMAs + last sampled price |
 | `vixLastSampleTick` / `vixSampleCount` / `vixBreakout` | Array[256] | Last sample tick / samples taken / breakout flag |
 | `vixBreakoutFactor` / `vixAbsFloorBps` / `vixSampleInterval` | sint64 / sint64 / uint32 | Breakout sensitivity (Type 18) / floor bps (Type 19) / sample interval (Type 20) |
+| `vixFastDays` / `vixSlowDays` | uint32 / uint32 | Fast/slow VIX EWMA horizons in days (Types 30/31; defaults 2 / 7 = 2-day / 1-week, pulse-rate-independent) |
 | `breakoutRescanTicks` | uint32 | Dagger hot re-scan pace (Type 22) |
 | `qxFeeLivePerTrade` | uint8 | QX-fee mode latch (Type 23) |
+
+### Self-healing tick rate
+Every duration timer above is authored at the **4 ticks/sec reference** (`VIX_DAY_TICKS` = 345,600 ticks/day)
+and scaled at each use-site by `× dayTicks / VIX_DAY_TICKS`. The contract **measures the real tick speed**
+off the deterministic consensus clock (`qpi.now()`, identical on every computor) once per ~reference-day
+and keeps a smoothed `dayTicks`, so a future change in the network's ticks/sec keeps every real-world
+duration (cadences, cooldowns, VIX sampling) intact **without a redeploy**. Guardrails: clamp to the
+**1–40 ticks/sec** band (out-of-band readings discarded), **~1-week EWMA** smoothing (α = 1/8) to ignore
+jitter, div-0 / overflow / anomalous-gap guards, **cold-start** at the reference (day-one behavior
+identical to a fixed contract), and a governance **emergency pin** (Type 33) as the seatbelt.
+
+| Variable | Type | Meaning |
+|---|---|---|
+| `dayTicks` | uint32 | Live smoothed ticks-per-day; default 345,600 (4/sec); clamped to [86,400 = 1/sec, 3,456,000 = 40/sec]. Every timer scales off it |
+| `tickRatePinnedSec` | uint32 | 0 = auto/self-heal (default); 1–40 = `dayTicks` frozen at this ticks/sec (emergency pin, Type 33) |
+| `calibAnchorTick` / `calibAnchorTime` | uint32 / DateAndTime | Measurement anchor — the tick# and consensus timestamp the current window is measured from |
+| `calibReady` | uint8 | 0 until the first anchor is captured (cold-start holds the default until then) |
 
 ---
 

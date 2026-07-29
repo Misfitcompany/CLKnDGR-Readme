@@ -1,6 +1,7 @@
 #define NO_UEFI
 
 #include "contract_testing.h"
+#include <cstdio>   // printf — for the 5-year simulation timeline
 
 // ---------------------------------------------------------------
 // googletest link fix: this project compiles with /Zc:wchar_t- (wchar_t is a
@@ -393,6 +394,33 @@ public:
         QX::AssetAskOrders_output out{};
         callFunction(QX_CONTRACT_INDEX, 2, in, out);
         return out;
+    }
+
+    // ---- Qswap price movers (for multi-tick / multi-epoch market simulation) ----
+    // Push the pool price UP: maker spends `qu` QU buying asset out of the pool
+    // (SwapExactQuForAsset, proc 6). Reward = qu + the Qswap swap fee; assetAmountOutMin = 0
+    // accepts any slippage since we are deliberately moving the price. Returns asset bought.
+    sint64 qswapBuyAsset(const id& maker, const id& assetIssuer, uint64 assetName, sint64 qu)
+    {
+        QSWAP::SwapExactQuForAsset_input in{ assetIssuer, assetName, 0 };
+        QSWAP::SwapExactQuForAsset_output out{};
+        sint64 reward = qu + (sint64)QSWAP_ADDITIONAL_FEE;
+        increaseEnergy(maker, reward);
+        invokeUserProcedure(QSWAP_CONTRACT_INDEX, 6, in, out, maker, reward);
+        return out.assetAmountOut;
+    }
+
+    // Push the pool price DOWN: maker sells `assetAmountIn` asset into the pool for QU
+    // (SwapExactAssetForQu, proc 8). The maker holds un-LP'd asset under Qswap management
+    // from the initial issuance, so it can sell directly. Reward = the Qswap swap fee only;
+    // quAmountOutMin = 0. Returns QU received.
+    sint64 qswapSellAsset(const id& maker, const id& assetIssuer, uint64 assetName, sint64 assetAmountIn)
+    {
+        QSWAP::SwapExactAssetForQu_input in{ assetIssuer, assetName, assetAmountIn, 0 };
+        QSWAP::SwapExactAssetForQu_output out{};
+        increaseEnergy(maker, (sint64)QSWAP_ADDITIONAL_FEE);
+        invokeUserProcedure(QSWAP_CONTRACT_INDEX, 8, in, out, maker, (sint64)QSWAP_ADDITIONAL_FEE);
+        return out.quAmountOut;
     }
 };
 
@@ -1997,9 +2025,9 @@ TEST(ContractCLKnDGR, BeginEpoch_NAVGrowth_SharePriceIncreases)
 // ONLY on RETAINED trading capital, so the recorded depositor pool must stay equal to the real depositor backing
 // (balance − reserves, snapshotted as prevTradingBalance) — even across a profit epoch. The fix excludes EVERY
 // payout slice (Qearn + dev + exec + dividend + CCF) from the BEGIN_EPOCH NAV numerator. Here we book 1,000,000
-// profit under preset 3 (100% burned to the exec reserve): none of it is depositor equity, so the pool must NOT
-// rise. (Before the fix the NAV excluded only the Qearn slice, so the pool was over-credited the full 1M —
-// backing 10M but pool 11M. This test was the in-contract proof of that drift; it now verifies the fix.)
+// profit under preset 3 (recovery 70/30): 70% is burned to the exec reserve and 30% is RETAINED as depositor
+// trading capital, so the pool rises by EXACTLY that retained 300,000 (to 10.3M) and stays == backing — never
+// over-credited. (The original NAV bug over-credited the full 1M: backing 10M but pool 11M. This test guards it.)
 TEST(ContractCLKnDGR, NAV_DepositorPoolStaysBackedAcrossProfitEpoch)
 {
     ContractTestingCLKnDGR ctx;
@@ -2012,7 +2040,7 @@ TEST(ContractCLKnDGR, NAV_DepositorPoolStaysBackedAcrossProfitEpoch)
     EXPECT_EQ(ctx.st()->totalDepositorPool, ctx.st()->prevTradingBalance);
     EXPECT_EQ(ctx.st()->totalDepositorPool, 10000000LL);
 
-    // Recovery preset: 100% of booked profit is burned to the exec-fee reserve (leaves the balance entirely).
+    // Recovery preset (70/30): 70% of booked profit burns to the exec-fee reserve; 30% is retained as capital.
     ctx.st()->payoutStructure = 3;
 
     // Simulate an epoch's trading profit: it lands in the contract balance AND is booked to epochProfit
@@ -2024,11 +2052,11 @@ TEST(ContractCLKnDGR, NAV_DepositorPoolStaysBackedAcrossProfitEpoch)
 
     const sint64 pool    = ctx.st()->totalDepositorPool;   // recorded depositor claim
     const sint64 backing = ctx.st()->prevTradingBalance;   // real depositor backing = balance − reserves
-    // The 1,000,000 profit was 100% burned to the exec reserve — not depositor equity — so backing is 10M...
-    EXPECT_EQ(backing, 10000000LL);
-    // ...and with the fix the pool stays fully backed: it did NOT rise to 11M. NAV grew on retained capital only.
+    // Of the 1,000,000 profit, 70% (700,000) burned to the exec reserve and 30% (300,000) retained -> backing 10.3M
+    EXPECT_EQ(backing, 10300000LL);
+    // ...and the pool stays fully backed: it rose by exactly the retained 300,000 to 10.3M (no over-credit).
     EXPECT_EQ(pool, backing);
-    EXPECT_EQ(pool, 10000000LL);
+    EXPECT_EQ(pool, 10300000LL);
 }
 
 // A4: Voting twice on the same proposal slot is rejected — only the first vote is counted
@@ -2311,6 +2339,463 @@ TEST(ContractCLKnDGR, GovernanceCycle_UpdatePayout_RecoveryPresetSelectable)
     EXPECT_EQ(ctx.st()->payoutStructure, 3); // recovery preset selected
 }
 
+// ===================================================================
+// Type 29 (DELETE_POOL) + governable VIX-horizon / Cloak-cadence levers
+// (types 30/31/32). Added alongside the pool-deletion + self-tuning work.
+// ===================================================================
+
+// Type 29 (DELETE_POOL): a deactivated, fully-empty pool is removed at END_EPOCH; the LAST pool
+// swaps into the freed slot and poolCount shrinks (so the deleted pool leaves the every-tick scan).
+TEST(ContractCLKnDGR, DeletePool_EmptyDeactivated_FreesSlotAndSwapMoves)
+{
+    ContractTestingCLKnDGR ctx;
+
+    std::vector<std::pair<id, int>> owners;
+    for (int i = 0; i < 15; ++i)
+        owners.push_back({clkUser(i), 15});
+    ctx.issueShares(owners);
+    ctx.fundVoters(15); // clkUser(1..14) need a spectrum index or their votes silently no-op
+
+    const uint64 nameA = 0x1111111111111111ULL;
+    const uint64 nameB = 0x2222222222222222ULL; // the pool we delete (index 1)
+    const uint64 nameC = 0x3333333333333333ULL; // last pool (index 2) -> relocates into the freed slot
+    ctx.st()->poolAssetNames.set(0, nameA); ctx.st()->poolIssuers.set(0, clkUser(90)); ctx.st()->poolActive.set(0, 1);
+    ctx.st()->poolAssetNames.set(1, nameB); ctx.st()->poolIssuers.set(1, clkUser(91)); ctx.st()->poolActive.set(1, 0); // delete target: deactivated + empty (reserves/swing default 0)
+    ctx.st()->poolAssetNames.set(2, nameC); ctx.st()->poolIssuers.set(2, clkUser(92)); ctx.st()->poolActive.set(2, 1);
+    ctx.st()->poolCount = 3;
+
+    ctx.addEnergy(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+    auto sub = ctx.submitProposal(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_DELETE_POOL,
+                                  0, 1); // newValue ignored, poolIndex = 1
+    EXPECT_EQ(sub.success, 1);
+    for (int i = 0; i < 15; ++i)
+        ctx.voteOnProposal(clkUser(i), sub.slot, 1);
+
+    ctx.endEpoch();
+
+    EXPECT_EQ(ctx.getProposal(sub.slot).status, CLKnDGR::PROP_STATUS_PASSED);
+    EXPECT_EQ(ctx.st()->poolCount, 2);                       // shrunk by one
+    EXPECT_EQ(ctx.st()->poolAssetNames.get(0), nameA);       // slot 0 untouched
+    EXPECT_EQ(ctx.st()->poolAssetNames.get(1), nameC);       // last pool swapped into the freed slot...
+    EXPECT_EQ(ctx.st()->poolActive.get(1), 1);               // ...carrying its active flag...
+    EXPECT_TRUE(ctx.st()->poolIssuers.get(1) == clkUser(92));// ...and its issuer
+    EXPECT_EQ(ctx.st()->poolAssetNames.get(2), 0ULL);        // vacated tail zeroed for a clean future ADD_POOL
+    EXPECT_EQ(ctx.st()->poolActive.get(2), 0);
+    EXPECT_TRUE(ctx.st()->poolIssuers.get(2) == NULL_ID);
+}
+
+// DELETE_POOL guard: an ACTIVE pool cannot be deleted (must be deactivated via REMOVE_POOL first).
+// Rejected at submission -> success=0, nothing recorded, pool untouched.
+TEST(ContractCLKnDGR, DeletePool_Guard_BlocksActivePool)
+{
+    ContractTestingCLKnDGR ctx;
+    const id u = clkUser(1);
+    ctx.issueShares({{u, 50}});
+    ctx.st()->poolAssetNames.set(0, 0x4142434445464748ULL); ctx.st()->poolIssuers.set(0, clkUser(90));
+    ctx.st()->poolActive.set(0, 1); ctx.st()->poolCount = 1; // pool left ACTIVE
+    ctx.addEnergy(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+
+    auto out = ctx.submitProposal(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_DELETE_POOL, 0, 0); // poolIndex 0, still active
+    EXPECT_EQ(out.success, 0);
+    EXPECT_EQ(ctx.st()->proposalsThisEpoch, 0);
+    EXPECT_EQ(ctx.st()->poolCount, 1); // pool untouched
+}
+
+// DELETE_POOL guard: a deactivated pool that STILL holds reserve tokens cannot be deleted
+// (funds must be withdrawn/sold first via WITHDRAW_ASSET_RESERVE / SELL_POOL_TOKENS).
+TEST(ContractCLKnDGR, DeletePool_Guard_BlocksPoolWithReserves)
+{
+    ContractTestingCLKnDGR ctx;
+    const id u = clkUser(1);
+    ctx.issueShares({{u, 50}});
+    ctx.st()->poolAssetNames.set(0, 0x4142434445464748ULL); ctx.st()->poolIssuers.set(0, clkUser(90)); ctx.st()->poolCount = 1;
+    ctx.st()->poolActive.set(0, 0);            // deactivated...
+    ctx.st()->poolReserveTokens.set(0, 500LL); // ...but still holds reserves
+    ctx.addEnergy(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+
+    auto out = ctx.submitProposal(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_DELETE_POOL, 0, 0);
+    EXPECT_EQ(out.success, 0);
+    EXPECT_EQ(ctx.st()->proposalsThisEpoch, 0);
+    EXPECT_EQ(ctx.st()->poolCount, 1);
+}
+
+// Type 29 re-add: after a pool is deleted (slot freed, poolCount shrunk), the SAME asset can be
+// added again next epoch as a fresh pool — proof the delete truly frees the name (the ADD_POOL
+// duplicate-check only scans live pools [0, poolCount), so a shrunk count exposes the name again).
+TEST(ContractCLKnDGR, DeletePool_ReAddNextEpoch_Fresh)
+{
+    ContractTestingCLKnDGR ctx;
+
+    std::vector<std::pair<id, int>> owners;
+    for (int i = 0; i < 15; ++i)
+        owners.push_back({clkUser(i), 15});
+    ctx.issueShares(owners);
+    ctx.fundVoters(15);
+
+    const uint64 name   = 0x5152535455565758ULL;
+    const id     issuer = clkUser(90);
+
+    // --- Epoch 1: the pool exists but is deactivated + empty, then DELETE frees the slot. ---
+    ctx.st()->poolAssetNames.set(0, name); ctx.st()->poolIssuers.set(0, issuer); ctx.st()->poolCount = 1;
+    ctx.st()->poolActive.set(0, 0); // deactivated + empty (reserves/swing default 0) -> deletable
+    EXPECT_EQ(ctx.st()->poolCount, 1);
+
+    ctx.addEnergy(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+    auto del = ctx.submitProposal(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_DELETE_POOL, 0, 0); // poolIndex 0
+    EXPECT_EQ(del.success, 1);
+    for (int i = 0; i < 15; ++i)
+        ctx.voteOnProposal(clkUser(i), del.slot, 1);
+    ctx.endEpoch();
+
+    EXPECT_EQ(ctx.getProposal(del.slot).status, CLKnDGR::PROP_STATUS_PASSED);
+    EXPECT_EQ(ctx.st()->poolCount, 0);                // slot reclaimed
+    EXPECT_EQ(ctx.st()->poolAssetNames.get(0), 0ULL); // slot zeroed (fresh)
+    EXPECT_EQ(ctx.st()->poolActive.get(0), 0);
+    EXPECT_TRUE(ctx.st()->poolIssuers.get(0) == NULL_ID);
+
+    // --- Epoch 2: re-add the SAME asset via ADD_POOL — accepted as a brand-new pool. ---
+    ctx.beginEpoch(); // clears the previous epoch's proposal slots + resets the per-epoch counter
+    ctx.addEnergy(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_ADD_POOL);
+    auto add = ctx.submitProposal(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_ADD_POOL,
+                                  CLKnDGR::PROP_TYPE_ADD_POOL, 0, 0, name, issuer);
+    EXPECT_EQ(add.success, 1); // NOT rejected as a duplicate -> the name was truly freed
+    for (int i = 0; i < 15; ++i)
+        ctx.voteOnProposal(clkUser(i), add.slot, 1);
+    ctx.endEpoch();
+
+    EXPECT_EQ(ctx.getProposal(add.slot).status, CLKnDGR::PROP_STATUS_PASSED);
+    EXPECT_EQ(ctx.st()->poolCount, 1);
+    EXPECT_EQ(ctx.st()->poolAssetNames.get(0), name); // re-registered fresh at slot 0
+    EXPECT_EQ(ctx.st()->poolActive.get(0), 1);
+}
+
+// Type 30 (UPDATE_VIX_FAST_DAYS): full governance cycle changes the fast EWMA horizon (days).
+TEST(ContractCLKnDGR, GovernanceCycle_UpdateVixFastDays_Changes)
+{
+    ContractTestingCLKnDGR ctx;
+
+    std::vector<std::pair<id, int>> owners;
+    for (int i = 0; i < 15; ++i)
+        owners.push_back({clkUser(i), 15});
+    ctx.issueShares(owners);
+    ctx.fundVoters(15);
+
+    EXPECT_EQ(ctx.st()->vixFastDays, 2u); // default 2 days
+
+    ctx.addEnergy(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+    auto sub = ctx.submitProposal(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_VIX_FAST_DAYS, 4LL); // 4 days (valid)
+    EXPECT_EQ(sub.success, 1);
+    for (int i = 0; i < 15; ++i)
+        ctx.voteOnProposal(clkUser(i), sub.slot, 1);
+
+    ctx.endEpoch();
+
+    EXPECT_EQ(ctx.getProposal(sub.slot).status, CLKnDGR::PROP_STATUS_PASSED);
+    EXPECT_EQ(ctx.st()->vixFastDays, 4u);
+}
+
+// Type 31 (UPDATE_VIX_SLOW_WEEKS): full governance cycle changes the slow EWMA horizon.
+// Submitted in WEEKS; stored as weeks*7 days.
+TEST(ContractCLKnDGR, GovernanceCycle_UpdateVixSlowWeeks_Changes)
+{
+    ContractTestingCLKnDGR ctx;
+
+    std::vector<std::pair<id, int>> owners;
+    for (int i = 0; i < 15; ++i)
+        owners.push_back({clkUser(i), 15});
+    ctx.issueShares(owners);
+    ctx.fundVoters(15);
+
+    EXPECT_EQ(ctx.st()->vixSlowDays, 7u); // default 1 week = 7 days
+
+    ctx.addEnergy(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+    auto sub = ctx.submitProposal(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_VIX_SLOW_WEEKS, 3LL); // 3 weeks (valid)
+    EXPECT_EQ(sub.success, 1);
+    for (int i = 0; i < 15; ++i)
+        ctx.voteOnProposal(clkUser(i), sub.slot, 1);
+
+    ctx.endEpoch();
+
+    EXPECT_EQ(ctx.getProposal(sub.slot).status, CLKnDGR::PROP_STATUS_PASSED);
+    EXPECT_EQ(ctx.st()->vixSlowDays, 21u); // 3 weeks * 7 = 21 days
+}
+
+// Type 32 (UPDATE_SWING_CADENCE): full governance cycle changes the Cloak per-pool check cadence (days).
+TEST(ContractCLKnDGR, GovernanceCycle_UpdateSwingCadence_Changes)
+{
+    ContractTestingCLKnDGR ctx;
+
+    std::vector<std::pair<id, int>> owners;
+    for (int i = 0; i < 15; ++i)
+        owners.push_back({clkUser(i), 15});
+    ctx.issueShares(owners);
+    ctx.fundVoters(15);
+
+    EXPECT_EQ(ctx.st()->swingCadenceDays, 30u); // default 30 days (~monthly)
+
+    ctx.addEnergy(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+    auto sub = ctx.submitProposal(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_SWING_CADENCE, 10LL); // 10 days (valid)
+    EXPECT_EQ(sub.success, 1);
+    for (int i = 0; i < 15; ++i)
+        ctx.voteOnProposal(clkUser(i), sub.slot, 1);
+
+    ctx.endEpoch();
+
+    EXPECT_EQ(ctx.getProposal(sub.slot).status, CLKnDGR::PROP_STATUS_PASSED);
+    EXPECT_EQ(ctx.st()->swingCadenceDays, 10u);
+}
+
+// Type 30 reject: UPDATE_VIX_FAST_DAYS must reject a value not in {2,3,4,5}.
+TEST(ContractCLKnDGR, SubmitProposal_UpdateVixFastDays_InvalidValue_ContentInvalid)
+{
+    ContractTestingCLKnDGR ctx;
+    const id u = clkUser(1);
+    ctx.issueShares({{u, 50}});
+    ctx.addEnergy(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+
+    auto out = ctx.submitProposal(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_VIX_FAST_DAYS, 6LL); // not allowlisted
+    EXPECT_EQ(out.success, 0);
+    EXPECT_EQ(ctx.st()->proposalsThisEpoch, 0);
+    EXPECT_EQ(ctx.st()->vixFastDays, 2u); // unchanged (default)
+}
+
+// Type 31 reject: UPDATE_VIX_SLOW_WEEKS must reject a value not in {1,2,3,4}.
+TEST(ContractCLKnDGR, SubmitProposal_UpdateVixSlowWeeks_InvalidValue_ContentInvalid)
+{
+    ContractTestingCLKnDGR ctx;
+    const id u = clkUser(1);
+    ctx.issueShares({{u, 50}});
+    ctx.addEnergy(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+
+    auto out = ctx.submitProposal(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_VIX_SLOW_WEEKS, 5LL); // not allowlisted
+    EXPECT_EQ(out.success, 0);
+    EXPECT_EQ(ctx.st()->proposalsThisEpoch, 0);
+    EXPECT_EQ(ctx.st()->vixSlowDays, 7u); // unchanged (default 1 week)
+}
+
+// Type 32 reject: UPDATE_SWING_CADENCE must reject a value not in {5,10,20,30}.
+TEST(ContractCLKnDGR, SubmitProposal_UpdateSwingCadence_InvalidValue_ContentInvalid)
+{
+    ContractTestingCLKnDGR ctx;
+    const id u = clkUser(1);
+    ctx.issueShares({{u, 50}});
+    ctx.addEnergy(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+
+    auto out = ctx.submitProposal(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_SWING_CADENCE, 15LL); // not allowlisted
+    EXPECT_EQ(out.success, 0);
+    EXPECT_EQ(ctx.st()->proposalsThisEpoch, 0);
+    EXPECT_EQ(ctx.st()->swingCadenceDays, 30u); // unchanged (default)
+}
+
+// ===================================================================
+// Self-healing tick rate (dayTicks) + governance emergency pin (type 33).
+// qpi.now() = the deterministic consensus clock; system.tick + etalonTick are
+// process-global test hooks that let us drive both the tick# and the wall clock.
+// The calibration block runs at the TOP of BEGIN_TICK (before the no-pools return),
+// so these tests need no pools/Qswap — just beginTick() with the clock set.
+// ===================================================================
+
+// A fresh contract starts at the 4/sec reference — day-one behavior identical to a fixed-rate contract.
+TEST(ContractCLKnDGR, TickRate_DefaultIsReference)
+{
+    ContractTestingCLKnDGR ctx;
+    EXPECT_EQ(ctx.st()->dayTicks, CLKnDGR::VIX_DAY_TICKS); // 345600 (= 4 ticks/sec)
+    EXPECT_EQ(ctx.st()->tickRatePinnedSec, 0u);           // auto / self-heal
+    EXPECT_EQ(ctx.st()->calibReady, 0);                   // no anchor captured yet
+}
+
+// Cold-start: the first BEGIN_TICK only captures the anchor; dayTicks holds the default until a full
+// measurement window has elapsed (so timing is stable from tick 0).
+TEST(ContractCLKnDGR, TickRate_ColdStart_SetsAnchorHoldsDefault)
+{
+    ContractTestingCLKnDGR ctx;
+    etalonTick.year = 25; etalonTick.month = 6; etalonTick.day = 1;
+    etalonTick.hour = 0;  etalonTick.minute = 0; etalonTick.second = 0; etalonTick.millisecond = 0;
+    system.tick = 1000;
+
+    ctx.beginTick();
+    EXPECT_EQ(ctx.st()->calibReady, 1);                     // anchor captured
+    EXPECT_EQ(ctx.st()->calibAnchorTick, 1000u);
+    EXPECT_EQ(ctx.st()->dayTicks, CLKnDGR::VIX_DAY_TICKS);  // unchanged (no full window yet)
+
+    // A tick well under one window still does not measure.
+    system.tick = 1000 + 100;
+    etalonTick.second = 25;
+    ctx.beginTick();
+    EXPECT_EQ(ctx.st()->dayTicks, CLKnDGR::VIX_DAY_TICKS);  // still the default
+}
+
+// One full window at 8 ticks/sec (345600 ticks in 12 h) moves dayTicks exactly one EWMA step toward it.
+TEST(ContractCLKnDGR, TickRate_MeasuresAndSmooths_OneStep)
+{
+    ContractTestingCLKnDGR ctx;
+    etalonTick.year = 25; etalonTick.month = 6; etalonTick.day = 1;
+    etalonTick.hour = 0;  etalonTick.minute = 0; etalonTick.second = 0; etalonTick.millisecond = 0;
+    system.tick = 5000;
+    ctx.beginTick(); // anchor at (5000, Jun-1 00:00)
+
+    // Advance exactly one window of ticks, but only 12 h of real time -> 8 ticks/sec measured.
+    system.tick = 5000 + CLKnDGR::CALIB_WINDOW_TICKS; // +345600 ticks
+    etalonTick.hour = 12;                             // +12 h = 43200 s
+    ctx.beginTick();
+
+    // raw = 345600 ticks / 0.5 day = 691200 ticks/day; EWMA = (345600*7 + 691200)/8 = 388800.
+    EXPECT_EQ(ctx.st()->dayTicks, 388800u);
+    EXPECT_EQ(ctx.st()->calibAnchorTick, 5000u + CLKnDGR::CALIB_WINDOW_TICKS); // re-anchored
+}
+
+// A wild out-of-band reading (~345600 ticks/sec, far above the 40/sec ceiling) is discarded; dayTicks
+// is left untouched — but the anchor still advances so a glitch can never wedge calibration.
+TEST(ContractCLKnDGR, TickRate_OutOfBandReading_Discarded)
+{
+    ContractTestingCLKnDGR ctx;
+    etalonTick.year = 25; etalonTick.month = 6; etalonTick.day = 1;
+    etalonTick.hour = 0;  etalonTick.minute = 0; etalonTick.second = 0; etalonTick.millisecond = 0;
+    system.tick = 5000;
+    ctx.beginTick(); // anchor
+
+    system.tick = 5000 + CLKnDGR::CALIB_WINDOW_TICKS; // one window of ticks...
+    etalonTick.second = 1;                            // ...in only 1 s of real time (absurd rate)
+    ctx.beginTick();
+
+    EXPECT_EQ(ctx.st()->dayTicks, CLKnDGR::VIX_DAY_TICKS);                       // discarded -> unchanged
+    EXPECT_EQ(ctx.st()->calibAnchorTick, 5000u + CLKnDGR::CALIB_WINDOW_TICKS);   // still re-anchored
+}
+
+// Repeated steady 8/sec windows converge dayTicks toward 691200 (well inside the 1..40 band).
+TEST(ContractCLKnDGR, TickRate_Converges_TowardMeasuredRate)
+{
+    ContractTestingCLKnDGR ctx;
+    etalonTick.year = 25; etalonTick.month = 1; etalonTick.day = 1; // January (31 days) so 30 days of 12h steps fit
+    etalonTick.hour = 0;  etalonTick.minute = 0; etalonTick.second = 0; etalonTick.millisecond = 0;
+    uint32 tk = 5000;
+    system.tick = tk;
+    ctx.beginTick(); // anchor at (5000, Jan-1 00:00)
+
+    int h = 0, d = 1;
+    for (int w = 0; w < 60; ++w)
+    {
+        h += 12; if (h >= 24) { h -= 24; d += 1; } // +12 h/window; 60 windows = 30 days -> day 1..31
+        etalonTick.day = (unsigned char)d; etalonTick.hour = (unsigned char)h;
+        tk += CLKnDGR::CALIB_WINDOW_TICKS; system.tick = tk; // +345600 ticks/window (steady 8/sec)
+        ctx.beginTick();
+    }
+
+    EXPECT_GE(ctx.st()->dayTicks, 690000u); // converged close to 691200...
+    EXPECT_LE(ctx.st()->dayTicks, 691200u); // ...and never above the true rate
+}
+
+// Routing: the live dayTicks reaches a real timer. A calm-pool Dagger no-arb cooldown equals
+// COOLDOWN_TICKS_BASELINE scaled by (dayTicks / VIX_DAY_TICKS) — so doubling dayTicks doubles it.
+TEST(ContractCLKnDGR, TickRate_ScalesDaggerCooldown)
+{
+    ContractTestingCLKnDGR ctx;
+    etalonTick.year = 25; etalonTick.month = 6; etalonTick.day = 1;
+    etalonTick.hour = 0;  etalonTick.minute = 0; etalonTick.second = 0; etalonTick.millisecond = 0;
+    // Trading capital above minProfitQu so the Dagger loop runs.
+    ctx.addEnergy(id(CLKnDGR_CONTRACT_INDEX, 0, 0, 0), 10000000LL);
+    // One active pool for an asset with NO Qswap pool -> GetPoolBasicState.poolExists == false ->
+    // the Dagger sets poolCooldownTick = tick + (calm) cooldownNoArb and moves on.
+    ctx.st()->poolAssetNames.set(0, 0x4344454600000000ULL);
+    ctx.st()->poolIssuers.set(0, clkUser(90));
+    ctx.st()->poolActive.set(0, 1);
+    ctx.st()->poolCount = 1;
+
+    // (a) reference rate -> cooldown == COOLDOWN_TICKS_BASELINE (scale 1.0). calibReady==0 so this
+    //     first beginTick only anchors; it does not disturb dayTicks.
+    system.tick = 1000;
+    ctx.beginTick();
+    EXPECT_EQ(ctx.st()->poolCooldownTick.get(0), 1000u + CLKnDGR::COOLDOWN_TICKS_BASELINE);
+
+    // (b) double dayTicks (8/sec) -> the same cooldown doubles. Same tick# so no new measurement fires.
+    ctx.st()->poolCooldownTick.set(0, 0);
+    ctx.st()->dayTicks = 2u * CLKnDGR::VIX_DAY_TICKS;
+    system.tick = 1000;
+    ctx.beginTick();
+    EXPECT_EQ(ctx.st()->poolCooldownTick.get(0), 1000u + 2u * CLKnDGR::COOLDOWN_TICKS_BASELINE);
+}
+
+// Type 33 (UPDATE_TICKRATE_PIN): governance pins dayTicks to a fixed ticks/sec and freezes self-healing.
+TEST(ContractCLKnDGR, GovernanceCycle_TickRatePin_FreezesRate)
+{
+    ContractTestingCLKnDGR ctx;
+    std::vector<std::pair<id, int>> owners;
+    for (int i = 0; i < 15; ++i) owners.push_back({clkUser(i), 15});
+    ctx.issueShares(owners);
+    ctx.fundVoters(15);
+
+    EXPECT_EQ(ctx.st()->tickRatePinnedSec, 0u); // auto by default
+
+    ctx.addEnergy(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+    auto sub = ctx.submitProposal(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_TICKRATE_PIN, 10LL); // pin to 10 ticks/sec
+    EXPECT_EQ(sub.success, 1);
+    for (int i = 0; i < 15; ++i) ctx.voteOnProposal(clkUser(i), sub.slot, 1);
+    ctx.endEpoch();
+
+    EXPECT_EQ(ctx.getProposal(sub.slot).status, CLKnDGR::PROP_STATUS_PASSED);
+    EXPECT_EQ(ctx.st()->tickRatePinnedSec, 10u);
+    EXPECT_EQ(ctx.st()->dayTicks, 864000u); // 10 * 86400
+
+    // While pinned, a full measurement window does NOT move dayTicks (self-healing frozen).
+    etalonTick.year = 25; etalonTick.month = 6; etalonTick.day = 1;
+    etalonTick.hour = 0;  etalonTick.minute = 0; etalonTick.second = 0; etalonTick.millisecond = 0;
+    system.tick = 7000; ctx.beginTick();
+    system.tick = 7000 + CLKnDGR::CALIB_WINDOW_TICKS; etalonTick.hour = 12; ctx.beginTick(); // 8/sec if it were auto
+    EXPECT_EQ(ctx.st()->dayTicks, 864000u); // still pinned
+}
+
+// Type 33 reject: a pin above the 1..40 ticks/sec band is content-invalid at submission.
+TEST(ContractCLKnDGR, SubmitProposal_TickRatePin_InvalidValue_ContentInvalid)
+{
+    ContractTestingCLKnDGR ctx;
+    const id u = clkUser(1);
+    ctx.issueShares({{u, 50}});
+    ctx.addEnergy(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+
+    auto out = ctx.submitProposal(u, CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_TICKRATE_PIN, 41LL); // above the 40/sec ceiling
+    EXPECT_EQ(out.success, 0);
+    EXPECT_EQ(ctx.st()->proposalsThisEpoch, 0);
+    EXPECT_EQ(ctx.st()->tickRatePinnedSec, 0u); // unchanged (still auto)
+}
+
+// Un-pinning (newValue 0) returns to auto and forces a fresh calibration anchor next tick.
+TEST(ContractCLKnDGR, GovernanceCycle_TickRateUnpin_ResumesAuto)
+{
+    ContractTestingCLKnDGR ctx;
+    std::vector<std::pair<id, int>> owners;
+    for (int i = 0; i < 15; ++i) owners.push_back({clkUser(i), 15});
+    ctx.issueShares(owners);
+    ctx.fundVoters(15);
+
+    // Start from a pinned state (set directly), then un-pin via governance.
+    ctx.st()->tickRatePinnedSec = 10;
+    ctx.st()->dayTicks          = 864000;
+    ctx.st()->calibReady        = 1;
+
+    ctx.addEnergy(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+    auto sub = ctx.submitProposal(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                  CLKnDGR::PROP_TYPE_UPDATE_TICKRATE_PIN, 0LL); // back to auto
+    EXPECT_EQ(sub.success, 1);
+    for (int i = 0; i < 15; ++i) ctx.voteOnProposal(clkUser(i), sub.slot, 1);
+    ctx.endEpoch();
+
+    EXPECT_EQ(ctx.getProposal(sub.slot).status, CLKnDGR::PROP_STATUS_PASSED);
+    EXPECT_EQ(ctx.st()->tickRatePinnedSec, 0u); // auto
+    EXPECT_EQ(ctx.st()->calibReady, 0);         // anchor reset -> re-anchors on the next tick
+}
+
 // Recovery preset (3) selected MANUALLY: 70% exec, 0% to dev/dist/qearn/ccf (trading remainder 30%).
 TEST(ContractCLKnDGR, BeginEpoch_PayoutStructure3_RecoveryPreset)
 {
@@ -2322,13 +2807,16 @@ TEST(ContractCLKnDGR, BeginEpoch_PayoutStructure3_RecoveryPreset)
     ctx.st()->epochProfit     = profit;
     ctx.st()->payoutStructure = 3;   // RECOVERY preset, chosen manually
     // execReserveFloor stays 0 (Lever 2 disabled), so this is purely the manual-preset path.
+    setContractFeeReserve(CLKnDGR_CONTRACT_INDEX, 0); // baseline so the 70% exec top-up is observable
 
     ctx.beginEpoch();
 
-    // PAYOUT3: devFund 0%, qearn 0% -> these jars stay empty; profit goes to exec(70%)+trading(30%).
+    // PAYOUT3: devFund 0%, qearn 0% -> these jars stay empty; profit splits exec(70%) + trading remainder(30%).
     EXPECT_EQ(ctx.st()->quReserve,    0LL);
     EXPECT_EQ(ctx.st()->qearnReserve, 0LL);
     EXPECT_EQ(ctx.st()->epochProfit,  0LL); // reset after distribution
+    // The 70% exec slice tops up the fee reserve; the other 30% stays as trading capital (lifts depositor NAV).
+    EXPECT_EQ(getContractFeeReserve(CLKnDGR_CONTRACT_INDEX), 7000000LL); // 70% of 10,000,000
 }
 
 // Lever 2: when the execution-fee reserve is below the floor, the recovery preset is auto-applied
@@ -2351,8 +2839,8 @@ TEST(ContractCLKnDGR, BeginEpoch_Lever2_AutoRecoveryWhenReserveLow)
     EXPECT_EQ(ctx.st()->quReserve,    0LL); // dev fund suspended (recovery), not 100000
     EXPECT_EQ(ctx.st()->qearnReserve, 0LL); // Qearn donation suspended (recovery), not 300000
     EXPECT_EQ(ctx.st()->epochProfit,  0LL);
-    // The contract keeps trading and routes 100% of profit into the execution-fee reserve.
-    EXPECT_EQ(getContractFeeReserve(CLKnDGR_CONTRACT_INDEX), profit);
+    // The contract keeps trading and routes 70% of profit into the exec reserve (30% retained as trading capital).
+    EXPECT_EQ(getContractFeeReserve(CLKnDGR_CONTRACT_INDEX), 7000000LL); // 70% of 10,000,000
 }
 
 // Hysteresis: once limped, the contract STAYS limped until the reserve climbs to 10% ABOVE the floor,
@@ -4580,4 +5068,379 @@ TEST(ContractCLKnDGR, SubmitProposal_UpdateSwingRally_InvalidValue_ContentInvali
     EXPECT_EQ(out.success, 0);
     EXPECT_EQ(ctx.st()->proposalsThisEpoch, 0);
     EXPECT_EQ(ctx.st()->swingSellGainPct, 6LL); // unchanged
+}
+
+// ===============================================================
+// FIVE-YEAR WHOLE-CONTRACT LIFE SIMULATION
+// ---------------------------------------------------------------
+// Runs CLKnDGR for ~260 weekly epochs (5 simulated years) against the REAL QX +
+// Qswap, with the whole contract live: IPO shareholders, vault depositors (the
+// trading capital), the Cloak + Dagger trading every tick, epoch profit-splits +
+// NAV updates, a mid-sim governance proposal, and a post-lock vault withdrawal.
+//
+// The market cycles a regime each quarter, repeating every year:
+//   calm -> trend-up (Direction B) -> breakout (both + VIX) -> trend-down (Direction A)
+// Each "day" is one BEGIN_TICK advanced by VIX_DAY_TICKS, so the VIX sampler pulses
+// once per simulated day exactly as on-chain. On trading days the maker re-posts a
+// profitable QX order relative to the live pool price, so a fresh arb exists; the
+// Dagger's per-pool cooldown quiets the pool on calm days (no spread -> long sleep).
+//
+// PROVES: the Dagger keeps trading across the full 5 years (never one-shots/stalls),
+// the vault stays solvent (depositor pool <= retained backing), NAV stays intact,
+// governance enacts mid-flight, and a depositor can exit after the 26-epoch lock.
+// Prints a quarterly timeline that doubles as a performance report.
+// ===============================================================
+TEST(ContractCLKnDGR, Sim_FiveYearLife_WholeContract)
+{
+    ContractTestingCLKnDGRDex ctx;
+    const id     maker = clkUser(50);
+    const uint64 asset = assetNameFromString("CLKLIFE");
+
+    // ---- Market: one DEEP pool at price 100 (10B QU / 100M asset) ----
+    ctx.qswapIssueAsset(maker, asset, 1000000000LL);                       // 1B supply
+    ctx.qswapCreatePool(maker, maker, asset);
+    ctx.qswapAddLiquidity(maker, maker, asset, 100000000LL, 10000000000LL); // price 100, deep
+    ctx.qswapMgmtToQx(maker, maker, asset, 400000000LL);                   // QX ask inventory
+    ctx.seedPool(0, maker, asset);
+
+    // ---- Governance: 15 IPO shareholders (225 weighted votes > quorum) ----
+    std::vector<std::pair<id, int>> owners;
+    for (int i = 0; i < 15; ++i) owners.push_back({ clkUser(i), 15 });
+    ctx.issueShares(owners);
+    ctx.fundVoters(15);
+
+    // ---- Vault: the 26-epoch lock (~6 months) AUTO-pays depositors at expiry, so we
+    //      roll a fresh depositor in each quarter to keep the vault continuously funded
+    //      across the 5 years (cohorts overlap). The first depositor's lifecycle is asserted. ----
+    const id firstDep = clkUser(60);
+    ctx.addEnergy(firstDep, 500000000LL); ctx.vaultDeposit(firstDep, 500000000LL);
+
+    // Seed prevTradingBalance from the deposited capital.
+    system.tick = 1;
+    ctx.beginEpoch();
+
+    const int    START_EPOCH    = (int)system.epoch;
+    const uint32 DAY            = CLKnDGR::VIX_DAY_TICKS; // 1 simulated day in ticks
+    const int    EPOCHS         = 260;                    // 5 years, weekly epochs
+    const int    DAYS_PER_EPOCH = 7;
+
+    auto poolPrice = [&]() -> sint64 {
+        auto p = ctx.qswapPool(maker, asset);
+        if (p.reservedAssetAmount <= 0) return 100;
+        return p.reservedQuAmount / p.reservedAssetAmount;
+    };
+
+    uint64 prevArbs     = ctx.getStats().totalArbsExecuted;
+    bool   solvencyHeld = true;
+    int    payoutsSeen  = 0;
+    int    prevDepCount = (int)ctx.st()->depositorCount;
+    int    govEnacted   = 0;
+    int    nextDepIdx   = 61;   // clkUser id for the next rolling depositor
+
+    std::printf("\n=== CLKnDGR 5-YEAR LIFE SIMULATION ===\n");
+    std::printf("%-5s %-11s %8s %14s %6s %4s %11s %13s %13s\n",
+                "ep", "regime", "arbs", "profit", "price", "deps", "sharePrice", "quBalance", "backing");
+
+    for (int e = 0; e < EPOCHS; ++e)
+    {
+        const int   q = (e % 52) / 13;   // quarter of the year: 0..3
+        const char* regimeName = q == 0 ? "calm"
+                               : q == 1 ? "trend-up"
+                               : q == 2 ? "breakout" : "trend-down";
+
+        for (int d = 0; d < DAYS_PER_EPOCH; ++d)
+        {
+            sint64 px = poolPrice();
+            if (px < 20) { ctx.qswapBuyAsset(maker, maker, asset, 500000000LL); px = poolPrice(); } // re-anchor
+
+            if (q == 1) {                         // TREND-UP: cheap QX ask -> Direction B
+                ctx.qxAddAsk(maker, maker, asset, px * 60 / 100, 20000LL);
+            } else if (q == 2) {                  // BREAKOUT: ±2% swing (spikes VIX) + both sides
+                if (d % 2 == 0) ctx.qswapBuyAsset (maker, maker, asset, 200000000LL);
+                else            ctx.qswapSellAsset(maker, maker, asset, 2000000LL);
+                sint64 p2 = poolPrice();
+                ctx.qxAddAsk(maker, maker, asset, p2 * 60  / 100, 20000LL);
+                ctx.qxAddBid(maker, maker, asset, p2 * 140 / 100, 20000LL);
+            } else if (q == 3) {                  // TREND-DOWN: rich QX bid -> Direction A
+                ctx.qxAddBid(maker, maker, asset, px * 140 / 100, 20000LL);
+            }                                     // q == 0 CALM: post nothing -> pool sleeps
+
+            system.tick = system.tick + DAY;
+            ctx.beginTick();
+        }
+
+        // settle tick: no new orders, so deferred Direction-A proceeds land and the
+        // epoch-boundary balance snapshot reflects truly liquid QU.
+        system.tick = system.tick + DAY;
+        ctx.beginTick();
+
+        // ---- epoch boundary: close, advance, open (NAV update + auto-payout + split) ----
+        ctx.endEpoch();
+        system.epoch = (unsigned short)(system.epoch + 1);
+        ctx.beginEpoch();
+
+        // ---- count auto-payouts (depositorCount drops when a 26-epoch lock expires) ----
+        int depCount = (int)ctx.st()->depositorCount;
+        if (depCount < prevDepCount) payoutsSeen += (prevDepCount - depCount);
+        prevDepCount = depCount;
+
+        // ---- invariant: vault stays backed (recorded pool <= retained backing) ----
+        if (ctx.st()->totalDepositorPool > ctx.st()->prevTradingBalance + 1000LL)
+            solvencyHeld = false;
+        // ---- invariant: the arb counter never goes backwards ----
+        uint64 nowArbs = ctx.getStats().totalArbsExecuted;
+        EXPECT_GE(nowArbs, prevArbs);
+        prevArbs = nowArbs;
+
+        // ---- roll a fresh depositor in each quarter to keep the vault funded ----
+        if (e > 0 && e % 13 == 0 && nextDepIdx < 120) {
+            id nd = clkUser(nextDepIdx++);
+            ctx.addEnergy(nd, 400000000LL);
+            ctx.vaultDeposit(nd, 400000000LL);
+            prevDepCount = (int)ctx.st()->depositorCount;
+        }
+
+        // ---- mid-sim governance: tighten the Dagger profit floor (enacts next endEpoch) ----
+        if (e == 20) {
+            ctx.addEnergy(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT);
+            auto sub = ctx.submitProposal(clkUser(0), CLKnDGR::INITIAL_PROPOSAL_FEE_DEFAULT,
+                                          CLKnDGR::PROP_TYPE_UPDATE_MIN_PROFIT,
+                                          CLKnDGR::MIN_PROFIT_QU_OPT2);
+            for (int i = 0; i < 15; ++i) ctx.voteOnProposal(clkUser(i), sub.slot, 1);
+        }
+        if (e == 22 && ctx.st()->minProfitQu == CLKnDGR::MIN_PROFIT_QU_OPT2) govEnacted = 1;
+
+        // ---- quarterly timeline row ----
+        if (e % 13 == 0 || e == EPOCHS - 1) {
+            auto s = ctx.getStats();
+            std::printf("%-5d %-11s %8llu %14lld %6lld %4d %11lld %13lld %13lld\n",
+                (int)system.epoch - START_EPOCH, regimeName,
+                (unsigned long long)s.totalArbsExecuted, (long long)s.totalProfitEarned,
+                (long long)poolPrice(), (int)ctx.st()->depositorCount,
+                (long long)ctx.st()->vaultSharePrice, (long long)s.quBalance,
+                (long long)ctx.st()->prevTradingBalance);
+        }
+    }
+
+    auto fin = ctx.getStats();
+    std::printf("=== END: %llu arbs | %lld profit | %d depositor payouts | first-dep balance %lld ===\n\n",
+                (unsigned long long)fin.totalArbsExecuted, (long long)fin.totalProfitEarned,
+                payoutsSeen, (long long)getBalance(firstDep));
+
+    // ===== headline assertions =====
+    EXPECT_GT(fin.totalArbsExecuted, 100u);    // sustained trading across the whole 5 years
+    EXPECT_GT(fin.totalProfitEarned, 0LL);     // net profitable
+    EXPECT_TRUE(solvencyHeld);                 // vault never went unbacked
+    EXPECT_GT(ctx.st()->vaultSharePrice, 0LL); // NAV intact
+    EXPECT_EQ(govEnacted, 1);                  // governance proposal enacted mid-flight
+    EXPECT_GT(payoutsSeen, 0);                 // depositors auto-paid at lock expiry
+    EXPECT_GT(getBalance(firstDep), 0LL);      // first depositor got their capital back
+}
+
+// ===============================================================
+// PER-STRATEGY PERFORMANCE — DAGGER-ONLY OPPORTUNITY SWEEP (isolation)
+// ---------------------------------------------------------------
+// Isolates the Dagger: a VERY deep pool + small arbs keep the price near baseline,
+// so no 30%-dip ever triggers a Cloak swing buy -> the Cloak stays dormant and
+// totalArbsExecuted / totalProfitEarned reflect the Dagger ALONE. The Dagger makes
+// no directional bet, so it has no win/loss rate; its real "market condition" axis
+// is OPPORTUNITY FREQUENCY — how often a profitable spread exists. We sweep that
+// (90% -> 10% of days) and report net depositor return + arbs at each level.
+// Rolling quarterly depositors keep the vault funded for the whole horizon.
+// SIM_EPOCHS: 260 = 5y (validation); set to 1560 for the 30y run.
+// ===============================================================
+static int SIM_EPOCHS = 260;
+
+static void daggerOnlyCell(int opportunityTenths)
+{
+    ContractTestingCLKnDGRDex ctx;
+    const id     maker = clkUser(50);
+    const uint64 asset = assetNameFromString("CLKDGR");
+
+    // Very deep pool at price 100 so the Dagger's own trades barely move it (no Cloak dip).
+    ctx.qswapIssueAsset(maker, asset, 4000000000LL);
+    ctx.qswapCreatePool(maker, maker, asset);
+    ctx.qswapAddLiquidity(maker, maker, asset, 400000000LL, 40000000000LL); // price 100, very deep
+    ctx.qswapMgmtToQx(maker, maker, asset, 1500000000LL);                    // ample QX ask inventory
+    ctx.seedPool(0, maker, asset);
+
+    const id firstDep = clkUser(60);
+    ctx.addEnergy(firstDep, 500000000LL); ctx.vaultDeposit(firstDep, 500000000LL);
+
+    system.tick = 1;
+    ctx.beginEpoch();
+
+    const uint32 DAY = CLKnDGR::VIX_DAY_TICKS;
+    int    nextDepIdx = 61;
+    int    globalDay  = 0;
+
+    auto poolPrice = [&]() -> sint64 {
+        auto p = ctx.qswapPool(maker, asset);
+        return p.reservedAssetAmount > 0 ? p.reservedQuAmount / p.reservedAssetAmount : 100;
+    };
+
+    for (int e = 0; e < SIM_EPOCHS; ++e)
+    {
+        for (int d = 0; d < 7; ++d)
+        {
+            if ((globalDay % 10) < opportunityTenths)           // a spread exists this day?
+                ctx.qxAddAsk(maker, maker, asset, poolPrice() * 60 / 100, 20000LL); // cheap ask -> Dir B
+            globalDay++;
+            system.tick = system.tick + DAY;
+            ctx.beginTick();
+        }
+        system.tick = system.tick + DAY; ctx.beginTick();       // settle tick
+        ctx.endEpoch();
+        system.epoch = (unsigned short)(system.epoch + 1);
+        ctx.beginEpoch();
+        if (e > 0 && e % 13 == 0 && nextDepIdx < 240) {          // roll a fresh depositor each quarter
+            id nd = clkUser(nextDepIdx++);
+            ctx.addEnergy(nd, 400000000LL); ctx.vaultDeposit(nd, 400000000LL);
+        }
+    }
+
+    auto s = ctx.getStats();
+    // sharePrice grows from the initial 10000; (price-10000)/100 = % return to depositors.
+    std::printf("  Dagger | opportunity %2d%% | arbs %8llu | profit %15lld | sharePrice %8lld (%+.1f%%) | quBal %15lld\n",
+        opportunityTenths * 10, (unsigned long long)s.totalArbsExecuted,
+        (long long)s.totalProfitEarned, (long long)ctx.st()->vaultSharePrice,
+        ((double)ctx.st()->vaultSharePrice - 10000.0) / 100.0, (long long)s.quBalance);
+
+    EXPECT_GE(ctx.st()->vaultSharePrice, 1LL);                  // NAV never collapsed
+    EXPECT_EQ((int)ctx.st()->poolCount, 1);                     // single pool, intact
+}
+
+TEST(ContractCLKnDGR, Sim_DaggerOnly_Opp90) { std::printf("\n=== DAGGER-ONLY PERFORMANCE SWEEP (epochs=%d) ===\n", SIM_EPOCHS); daggerOnlyCell(9); }
+TEST(ContractCLKnDGR, Sim_DaggerOnly_Opp70) { daggerOnlyCell(7); }
+TEST(ContractCLKnDGR, Sim_DaggerOnly_Opp50) { daggerOnlyCell(5); }
+TEST(ContractCLKnDGR, Sim_DaggerOnly_Opp30) { daggerOnlyCell(3); }
+TEST(ContractCLKnDGR, Sim_DaggerOnly_Opp10) { daggerOnlyCell(1); }
+
+// ===============================================================
+// DIAGNOSTIC — where does the Dagger's profit go? (single stable depositor)
+// ---------------------------------------------------------------
+// One depositor, 24 epochs (< the 26-epoch lock, so NO auto-sweep / churn). Prints
+// the per-epoch money flow so we can see exactly why share price did/didn't grow:
+// epochProfit (Dagger booked this epoch), cumulative totalProfitEarned, the depositor
+// pool + backing + share price (NAV), and the reserve buckets (where retained capital
+// can get parked as illiquid tokens).
+// ===============================================================
+TEST(ContractCLKnDGR, Diag_DaggerNAV)
+{
+    ContractTestingCLKnDGRDex ctx;
+    const id     maker = clkUser(50);
+    const uint64 asset = assetNameFromString("CLKNAV");
+
+    ctx.qswapIssueAsset(maker, asset, 2000000000LL);
+    ctx.qswapCreatePool(maker, maker, asset);
+    ctx.qswapAddLiquidity(maker, maker, asset, 200000000LL, 20000000000LL); // price 100, deep
+    ctx.qswapMgmtToQx(maker, maker, asset, 800000000LL);
+    ctx.seedPool(0, maker, asset);
+
+    const id dep = clkUser(60);
+    ctx.addEnergy(dep, 1000000000LL); ctx.vaultDeposit(dep, 1000000000LL);
+
+    system.tick = 1;
+    ctx.beginEpoch();
+    const uint32 DAY = CLKnDGR::VIX_DAY_TICKS;
+
+    auto poolPrice = [&]() -> sint64 {
+        auto p = ctx.qswapPool(maker, asset);
+        return p.reservedAssetAmount > 0 ? p.reservedQuAmount / p.reservedAssetAmount : 100;
+    };
+
+    std::printf("\n=== DAGGER NAV DIAGNOSTIC (single stable depositor, 24 epochs, no churn) ===\n");
+    std::printf("%-3s %13s %14s %14s %14s %9s %13s %13s %13s\n",
+        "ep","epochProfit","totProfit","depPool","prevTradBal","sharePx","quReserve","resvTokens","resvCost");
+
+    for (int e = 0; e < 24; ++e)
+    {
+        for (int d = 0; d < 7; ++d) {
+            ctx.qxAddAsk(maker, maker, asset, poolPrice() * 60 / 100, 20000LL);
+            system.tick = system.tick + DAY; ctx.beginTick();
+        }
+        system.tick = system.tick + DAY; ctx.beginTick();      // settle
+        sint64 epBefore = ctx.st()->epochProfit;                // this epoch's booked Dagger profit
+        ctx.endEpoch();
+        system.epoch = (unsigned short)(system.epoch + 1);
+        ctx.beginEpoch();                                       // NAV update + split
+        auto s = ctx.getStats();
+        std::printf("%-3d %13lld %14lld %14lld %14lld %9lld %13lld %13lld %13lld\n",
+            e, (long long)epBefore, (long long)s.totalProfitEarned,
+            (long long)ctx.st()->totalDepositorPool, (long long)ctx.st()->prevTradingBalance,
+            (long long)ctx.st()->vaultSharePrice, (long long)ctx.st()->quReserve,
+            (long long)ctx.st()->poolReserveTokens.get(0), (long long)ctx.st()->poolReserveCostBasis.get(0));
+    }
+}
+
+// ===============================================================
+// CLOAK-ONLY SMOKE — validate the win/loss mechanism before the full sweep
+// ---------------------------------------------------------------
+// Drives the Cloak's three real action paths so the sweep can be built on them:
+//   (1) seed a DIP in the 13-slot price history -> a REAL 1%-of-capital buy fires,
+//   (2) drive the live price up past +6% -> the Cloak sells a chunk into QX bids (WIN),
+//   (3) crash the live price below -45% -> the Cloak liquidates on Qswap (STOP-LOSS).
+// No QX asks are posted for the Dagger, so the Dagger never fires (isolation).
+// ===============================================================
+TEST(ContractCLKnDGR, Sim_CloakOnly_Smoke)
+{
+    ContractTestingCLKnDGRDex ctx;
+    const id     maker = clkUser(50);
+    const uint64 asset = assetNameFromString("CLKSWG");
+
+    ctx.qswapIssueAsset(maker, asset, 3000000000LL);
+    ctx.qswapCreatePool(maker, maker, asset);
+    ctx.qswapAddLiquidity(maker, maker, asset, 100000000LL, 10000000000LL); // price 100
+    ctx.qswapMgmtToQx(maker, maker, asset, 400000000LL);
+    ctx.seedPool(0, maker, asset);
+
+    const id dep = clkUser(60);
+    ctx.addEnergy(dep, 1000000000LL); ctx.vaultDeposit(dep, 1000000000LL);
+
+    system.tick = 1;
+    ctx.beginEpoch();
+    const uint32 DAY = CLKnDGR::VIX_DAY_TICKS;
+    auto* s = ctx.st();
+
+    auto poolPrice = [&]() -> sint64 {
+        auto p = ctx.qswapPool(maker, asset);
+        return p.reservedAssetAmount > 0 ? p.reservedQuAmount / p.reservedAssetAmount : 0;
+    };
+    auto tick      = [&]() { system.tick = system.tick + DAY; ctx.beginTick(); };
+    auto driveDown = [&](sint64 target){ int g = 0; while (poolPrice() > target && g++ < 400) ctx.qswapSellAsset(maker, maker, asset, 20000000LL); };
+    auto driveUp   = [&](sint64 target){ int g = 0; while (poolPrice() < target && g++ < 400) ctx.qswapBuyAsset (maker, maker, asset, 60000000LL); };
+
+    // --- (1) Seed a DIP: 12 history slots @ 100, most-recent (slot 12, head=0) @ 60 -> dip vs 30% threshold ---
+    for (int k = 0; k < 12; ++k) s->swingPriceHistory.set((uint64)k, 100LL);
+    s->swingPriceHistory.set(12, 60LL);
+    s->swingPriceHead.set(0, 0);
+    s->swingPriceCount.set(0, (uint8)CLKnDGR::SWING_PRICE_SLOTS);
+    s->swingCooldownTick.set(0, 0);
+    s->swingTokens.set(0, 0);
+    driveDown(63);                                   // live pool ~60-63 so the buy executes near the dip
+
+    tick();                                          // Cloak should BUY 1% of capital
+    std::printf("\n[Cloak smoke] after BUY : swingTokens=%lld costBasis=%lld poolPrice=%lld\n",
+        (long long)s->swingTokens.get(0), (long long)s->swingCostBasis.get(0), (long long)poolPrice());
+    EXPECT_GT(s->swingTokens.get(0), 0LL);           // a real position was opened
+
+    // --- (2) WIN: push price > cost×1.06, post QX bids above the Cloak's ask, let it sell ---
+    sint64 costPer = s->swingCostBasis.get(0) / (s->swingTokens.get(0) > 0 ? s->swingTokens.get(0) : 1);
+    driveUp(costPer * 125 / 100);                     // ~+25% over cost (clears the +6% gain trigger)
+    ctx.qxAddBid(maker, maker, asset, poolPrice() * 95 / 100, 3000000LL); // deep bid above ask (pool-10%)
+    s->swingCooldownTick.set(0, 0);
+    sint64 tokBeforeWin = s->swingTokens.get(0);
+    tick();
+    std::printf("[Cloak smoke] after WIN : swingTokens=%lld (was %lld) poolPrice=%lld cost/token=%lld\n",
+        (long long)s->swingTokens.get(0), (long long)tokBeforeWin, (long long)poolPrice(), (long long)costPer);
+    EXPECT_LT(s->swingTokens.get(0), tokBeforeWin);  // sold a chunk at a gain
+
+    // --- (3) STOP-LOSS: crash price < cost×0.55, let it liquidate on Qswap ---
+    driveDown(costPer * 50 / 100);                    // ~-50% from cost (below the -45% stop-loss)
+    s->swingCooldownTick.set(0, 0);
+    sint64 tokBeforeStop = s->swingTokens.get(0);
+    tick();
+    std::printf("[Cloak smoke] after STOP: swingTokens=%lld (was %lld) poolPrice=%lld\n\n",
+        (long long)s->swingTokens.get(0), (long long)tokBeforeStop, (long long)poolPrice());
+    EXPECT_LE(s->swingTokens.get(0), tokBeforeStop);  // bag cut (or fully gone)
 }

@@ -90,13 +90,14 @@ struct CLKnDGR : public ContractBase
     static constexpr uint64 PAYOUT2_QEARN_PCT      = 3;
     static constexpr uint64 PAYOUT2_CCF_PCT        = 1;
 
-    // Structure 3 — RECOVERY / limp mode: 100% exec fees | 0% everything else (0% trading remainder).
+    // Structure 3 — RECOVERY / limp mode: 70% exec fees | 30% trading remainder | 0% everything else.
     // Auto-applied when the execution-fee reserve < execReserveFloor, OR selectable manually via
-    // UPDATE_PAYOUT. The contract KEEPS TRADING NORMALLY (it does NOT pause) and routes 100% of its
+    // UPDATE_PAYOUT. The contract KEEPS TRADING NORMALLY (it does NOT pause) and routes 70% of its
     // profit into the execution-fee reserve — rebuilding the fee budget from its own earnings — while
-    // suspending the shareholder / Qearn / dev-fund / CCF payouts until the reserve recovers.
+    // still crediting depositors the retained 30% (their vault NAV keeps growing through recovery) and
+    // suspending only the shareholder / Qearn / dev-fund / CCF payouts until the reserve recovers.
     static constexpr uint64 PAYOUT3_DEV_FUND_PCT  = 0;
-    static constexpr uint64 PAYOUT3_EXEC_FEE_PCT  = 100;
+    static constexpr uint64 PAYOUT3_EXEC_FEE_PCT  = 70;
     static constexpr uint64 PAYOUT3_DIST_PCT       = 0;
     static constexpr uint64 PAYOUT3_QEARN_PCT      = 0;
     static constexpr uint64 PAYOUT3_CCF_PCT        = 0;
@@ -129,13 +130,13 @@ struct CLKnDGR : public ContractBase
     // ---------------------------------------------------------------
     // Cloak (swing trade) constants
     // ---------------------------------------------------------------
-    static constexpr uint32 SWING_COOLDOWN_TICKS         = 10368000; // 30 days @ 4 ticks/sec — the Cloak checks each pool ~once a month (buy / DCA-add / sell)
+    static constexpr uint32 INITIAL_SWING_CADENCE_DAYS   = 30;       // Cloak per-pool check cadence (days); default 30 (~monthly); governable 30/20/10/5 via PROP_TYPE_UPDATE_SWING_CADENCE. cooldown ticks = days x dayTicks (live self-healing ticks/day; VIX_DAY_TICKS=345600 is the 4/sec reference)
     static constexpr uint64 SWING_DCA_ADD_DIVISOR        = 400;      // each DCA-in add = trading capital / 400 = 0.25% (the first buy is SWING_BUY_CAPITAL_PCT = 1%)
     static constexpr uint64 MAX_SWING_POSITION_PCT       = 5;        // stop DCA-adding once a token's cost basis reaches 5% of trading capital (re-opens as capital grows or it sells)
     static constexpr uint8  SWING_PRICE_SLOTS            = 13;     // rolling epoch price buffer (~3 months)
     static constexpr uint64 SWING_BUY_DIP_PCT            = 30;     // DEFAULT buy-dip threshold: buy when 1-week avg <= 3-month avg × 70% (30% below); governable via PROP_TYPE_UPDATE_SWING_DIP
     static constexpr uint64 SWING_SELL_GAIN_PCT          = 6;      // DEFAULT rally-sell threshold: sell when pool price >= cost per token × 106% (6% above); governable via PROP_TYPE_UPDATE_SWING_RALLY
-    static constexpr uint64 INITIAL_SWING_SELL_PCT       = 50;     // default: sell 50% of the swing bag per +12% trigger; governable via PROP_TYPE_UPDATE_SWING_SELL_PCT
+    static constexpr uint64 INITIAL_SWING_SELL_PCT       = 50;     // default: sell 50% of the swing bag per +6% rally-sell trigger (swingSellGainPct default); governable via PROP_TYPE_UPDATE_SWING_SELL_PCT
     static constexpr uint64 SWING_BUY_CAPITAL_PCT        = 1;      // 1% of tradingBalance per swing buy
     static constexpr uint64 SWING_LIQUIDITY_REQUIRED_PCT = 80;     // min % of desired QU available in QX bid book
     static constexpr uint64 SWING_ASK_DISCOUNT_PCT       = 10;     // ask placed 10% below pool price for guaranteed fill
@@ -175,12 +176,24 @@ struct CLKnDGR : public ContractBase
     // ---------------------------------------------------------------
     // VIX — volatility-gated Dagger constants
     // ---------------------------------------------------------------
-    // A cheap per-pool volatility index, sampled from the Qswap pool 3×/day, decides WHEN the Dagger
+    // A cheap per-pool volatility index, sampled from the Qswap pool ~1×/day (default), decides WHEN the Dagger
     // bothers to scan: it hunts at tick speed during a volatility breakout and sleeps when calm.
-    static constexpr uint32 VIX_DAY_TICKS                = 345600;  // 1 day @ 4 ticks/sec — base for the pulse-rate options
+    static constexpr uint32 VIX_DAY_TICKS                = 345600;  // 1 day @ 4 ticks/sec — the REFERENCE tick-rate all durations are authored against; live timing scales by (dayTicks / VIX_DAY_TICKS)
+    // ---- Self-healing tick-rate calibration (dayTicks) ----
+    // Every duration constant below is authored at the 4 ticks/sec reference (VIX_DAY_TICKS ticks = 1 day).
+    // The contract MEASURES the real tick rate from the deterministic consensus clock (qpi.now()) and keeps
+    // a live `dayTicks` (smoothed ticks-per-day). Each timer USE-site scales by (dayTicks / VIX_DAY_TICKS),
+    // so a network tick-speed change keeps every real-world duration intact WITHOUT a redeploy. dayTicks
+    // starts at the reference (identical day-one behavior) and is clamped to the accepted 1..40 ticks/sec band.
+    static constexpr uint32 DAYTICKS_MIN                 = 86400;   // 1 tick/sec  × 86400 — floor of the accepted band (glitch filter)
+    static constexpr uint32 DAYTICKS_MAX                 = 3456000; // 40 ticks/sec × 86400 — ceiling of the accepted band (glitch filter)
+    static constexpr uint32 CALIB_WINDOW_TICKS           = 345600;  // measure ~once per reference-day; a measured window's real duration drives the rate estimate
+    static constexpr uint64 TICKRATE_EWMA_DIV            = 8;       // EWMA divisor (α = 1/8): ~1 week to converge at ~daily windows — smooths jitter, still tracks a real shift
+    static constexpr uint64 MICROSEC_PER_DAY             = 86400000000ULL; // 86400 sec/day × 1e6 µs/sec — used to convert measured µs into ticks/day
+    static constexpr sint64 TICKRATE_PIN_MAX_SPS         = 40;      // governance emergency pin: max pinned ticks/sec (0 = auto/self-heal); matches DAYTICKS_MAX band
     static constexpr uint32 INITIAL_VIX_SAMPLE_INTERVAL  = 345600;  // default 1 pulse/day; governable via PROP_TYPE_UPDATE_VIX_PULSE_RATE (1/2/3 per day)
-    static constexpr uint64 VIX_FAST_DAYS                = 5;       // fast EWMA horizon ≈ 5 days; divisor = days × pulses/day, so the TIME horizon stays fixed regardless of pulse rate
-    static constexpr uint64 VIX_SLOW_DAYS                = 28;      // slow EWMA horizon ≈ 4 weeks — the per-token baseline
+    static constexpr uint64 INITIAL_VIX_FAST_DAYS        = 2;       // initial fast EWMA horizon (days); default 2; governable 2/3/4/5 via PROP_TYPE_UPDATE_VIX_FAST_DAYS. divisor = days x pulses/day, so the TIME horizon is independent of the pulse rate
+    static constexpr uint64 INITIAL_VIX_SLOW_DAYS        = 7;       // initial slow EWMA horizon (days); default 7 (1 week); governable 1/2/3/4 weeks (x7) via PROP_TYPE_UPDATE_VIX_SLOW_WEEKS
     static constexpr sint64 VIX_MOVE_CAP_BPS             = 100000;  // cap one sample's move at 1000% (outlier + overflow guard)
     static constexpr uint32 COOLDOWN_TICKS_BREAKOUT      = 1200;    // 5 min @ 4 ticks/sec — Dagger re-scan beat while a pool is breaking out
     static constexpr uint32 COOLDOWN_TICKS_BASELINE      = 4838400; // 2 weeks @ 4 ticks/sec — safety-net scan for calm pools (catches standing arbs without frequent polling)
@@ -217,6 +230,11 @@ struct CLKnDGR : public ContractBase
     static constexpr uint8 PROP_TYPE_UPDATE_SWING_SIZING     = 26; // update swingSizingPreset (Cloak first-buy/DCA-add/cap bundle); newValue = 0,1,2,3 (default 0 = 1%/0.25%/5%)
     static constexpr uint8 PROP_TYPE_UPDATE_SWING_DIP        = 27; // update swingBuyDipPct (Cloak buy-dip threshold, % below 3-month avg); newValue = 5,10,15,20,25,30 (default 30)
     static constexpr uint8 PROP_TYPE_UPDATE_SWING_RALLY      = 28; // update swingSellGainPct (Cloak rally-sell threshold, % above cost); newValue = 6,12,18,24,30 (default 6)
+    static constexpr uint8 PROP_TYPE_DELETE_POOL             = 29; // permanently free a pool's slot (compacts the pool arrays, shrinks poolCount so it leaves the every-tick scan). GUARD: the pool must ALREADY be deactivated (REMOVE_POOL) AND fully emptied — no reserve tokens, no swing position, nothing pending in recovery (WITHDRAW_ASSET_RESERVE / SELL_POOL_TOKENS first). Deliberate multi-vote flow: deactivate -> withdraw -> delete. Re-addable later via ADD_POOL as a fresh pool.
+    static constexpr uint8 PROP_TYPE_UPDATE_VIX_FAST_DAYS    = 30; // update vixFastDays (VIX fast EWMA horizon, days); newValue = 2,3,4,5 (default 2)
+    static constexpr uint8 PROP_TYPE_UPDATE_VIX_SLOW_WEEKS   = 31; // update vixSlowDays (VIX slow EWMA horizon); newValue = 1,2,3,4 weeks -> stored as newValue*7 days (default 1 week = 7)
+    static constexpr uint8 PROP_TYPE_UPDATE_SWING_CADENCE    = 32; // update swingCadenceDays (Cloak per-pool check cadence, days); newValue = 5,10,20,30 (default 30 ~ monthly)
+    static constexpr uint8 PROP_TYPE_UPDATE_TICKRATE_PIN     = 33; // EMERGENCY seatbelt for the self-healing tick rate: newValue = 0 (auto/self-heal, default) or 1..40 = PIN dayTicks to newValue ticks/sec. Use only if the auto-tuner misbehaves.
 
     // ---------------------------------------------------------------
     // Direct action constants
@@ -306,7 +324,7 @@ struct CLKnDGR : public ContractBase
         sint64 vixBreakoutFactor;  // VIX breakout multiplier ×100 (200 = 2.00×)
         sint64 vixAbsFloorBps;     // VIX absolute floor in basis points
         uint32 vixSampleInterval;  // ticks between VIX pulses (345600=1/day, 172800=2/day, 115200=3/day)
-        sint64 swingSellPct;       // Cloak sell chunk % per +12% trigger
+        sint64 swingSellPct;       // Cloak sell chunk % per +6% rally-sell trigger (swingSellGainPct default)
         sint64 stopLossTriggerPct; // Cloak stop-loss cut threshold (% below avg cost; 0 = disabled)
         sint64 stopLossSellPct;    // Cloak stop-loss: % of a losing bag sold per trigger
         uint32 breakoutRescanTicks;// Dagger breakout re-scan pace (ticks; ÷4 = seconds)
@@ -443,6 +461,13 @@ struct CLKnDGR : public ContractBase
         QSWAP::QuoteExactAssetInput_output sellQaOut;
         QSWAP::SwapExactAssetForQu_input   sellSwapIn;
         QSWAP::SwapExactAssetForQu_output  sellSwapOut;
+        // PROP_TYPE_DELETE_POOL — deferred slot-reclaim pass (runs after the main proposal loop)
+        uint16  delDoneMask;   // bitmask of DELETE_POOL proposal slots already applied this epoch
+        uint16  delSlot;       // chosen proposal slot this iteration (0xFFFF = none)
+        sint64  delTarget;     // chosen poolIndex to delete this iteration (-1 = none; highest first)
+        uint64  delIdx;        // pool slot being freed
+        uint64  delLast;       // current last pool slot (poolCount-1) moved into the freed slot
+        uint64  delS;          // swingPriceHistory slot loop index (0..SWING_PRICE_SLOTS-1)
     };
 
     struct BEGIN_EPOCH_locals
@@ -487,6 +512,11 @@ struct CLKnDGR : public ContractBase
         // Vault NAV update and auto-payout
         sint64 vaultCurBalance;     // contractBalance - quReserve - qearnReserve - qearnDonateAmt(this epoch) - waitlistQu
         sint64 vaultNewPool;        // updated totalDepositorPool after NAV ratio
+        sint64 vaultGain;           // signed per-epoch backing change (vaultCurBalance - prevTradingBalance)
+        sint64 vaultAbsGain;        // |vaultGain|
+        uint64 vaultRatioInt;       // whole multiples of prevTradingBalance in vaultAbsGain (0..8 after cap)
+        uint64 vaultRatioRem;       // remainder for the precise overflow-safe pool delta
+        sint64 vaultPoolDelta;      // pool × vaultGain / prevTradingBalance (precise, signed)
         sint64 vaultPostSplitBal;   // trading balance after profit split; saved as prevTradingBalance
         uint16 vaultK;              // loop index for auto-payout sweep
         id     vaultPayee;          // current depositor being processed
@@ -614,9 +644,14 @@ struct CLKnDGR : public ContractBase
         sint64 vixMoveBps;     // relative move this sample, basis points, capped
         uint8  vixBreakoutNow; // 1 = this pool just computed a breakout
         uint64 vixSpd;         // VIX pulses per day (1/2/3), derived from the governable interval
-        uint64 vixFastDiv;     // fast EWMA divisor = VIX_FAST_DAYS × vixSpd (keeps the ~5-day horizon fixed)
-        uint64 vixSlowDiv;     // slow EWMA divisor = VIX_SLOW_DAYS × vixSpd (keeps the ~4-week horizon fixed)
+        uint64 vixFastDiv;     // fast EWMA divisor = vixFastDays x vixSpd (horizon in days is governable; pulse-rate-independent)
+        uint64 vixSlowDiv;     // slow EWMA divisor = vixSlowDays x vixSpd (horizon in days is governable; pulse-rate-independent)
         uint32 cooldownNoArb;  // adaptive no-arb cooldown: COOLDOWN_TICKS_BREAKOUT (in breakout) or COOLDOWN_TICKS_BASELINE (calm)
+        // Self-healing tick-rate calibration scratch
+        uint64 calibElapsedMicrosec; // real µs since the anchor (qpi.now() diff)
+        uint64 calibDeltaTicks;      // ticks since the anchor
+        uint64 calibRawDayTicks;     // this window's raw ticks/day estimate (pre-smoothing)
+        uint64 calibNewDayTicks;     // EWMA-smoothed, clamped result folded into state.dayTicks
     };
 
     // ---------------------------------------------------------------
@@ -707,7 +742,7 @@ struct CLKnDGR : public ContractBase
         uint16 depositorCount;        // number of active depositor slots occupied
         sint64 depositorVoteMinQu;    // governance-controlled minimum QU locked to cast a depositor veto vote; valid: 50M, 150M, 250M, 350M
         sint64 relockAddAmount;       // minimum QU to add when re-locking; initial: 10M; governable via PROP_TYPE_UPDATE_RELOCK_AMOUNT
-        sint64 execReserveFloor;      // fee-reserve safety valve: when the execution-fee reserve < this, divert ALL profit to the reserve (recovery preset 3) until it refills — the contract keeps trading normally; 0 = disabled; governable via PROP_TYPE_UPDATE_EXEC_RESERVE_FLOOR
+        sint64 execReserveFloor;      // fee-reserve safety valve: when the execution-fee reserve < this, route 70% of profit to the reserve (recovery preset 3; the other 30% is retained as depositor trading capital) until it refills — the contract keeps trading normally; 0 = disabled; governable via PROP_TYPE_UPDATE_EXEC_RESERVE_FLOOR
         uint8  inLimpMode;            // 1 = in recovery/limp mode. Hysteresis latch: enter when reserve < execReserveFloor, exit only once reserve >= execReserveFloor * 1.1 (prevents flapping at the boundary)
 
         // One record per depositor wallet — {shares, costBasis, epoch} (formerly three parallel maps;
@@ -741,7 +776,7 @@ struct CLKnDGR : public ContractBase
         Array<sint64, 256>  swingTokens;      // tokens held per pool from swing buys
         Array<sint64, 256>  swingCostBasis;   // total QU paid for swingTokens per pool
 
-        // Per-pool cooldown shared by buy and sell actions (~30-day / monthly — SWING_COOLDOWN_TICKS)
+        // Per-pool cooldown shared by buy and sell actions (~monthly by default; window in days = swingCadenceDays, governable via PROP_TYPE_UPDATE_SWING_CADENCE)
         Array<uint32, 256>  swingCooldownTick;
 
         // Swing TSRM recovery — tokens stuck under a DEX's managing rights.
@@ -758,15 +793,24 @@ struct CLKnDGR : public ContractBase
         // Sampled from the Qswap pool every vixSampleInterval ticks (governable pulse rate). vixFast/vixSlow are running
         // averages (EWMA) of the absolute % price move per sample, in basis points. A breakout
         // (fast >= slow × factor AND fast >= floor) flags the pool and wakes the Dagger to hunt it.
-        Array<sint64, 256>  vixFast;            // fast volatility EWMA (bps), ~5-day feel
-        Array<sint64, 256>  vixSlow;            // slow volatility EWMA (bps), ~4-week baseline
+        Array<sint64, 256>  vixFast;            // fast volatility EWMA (bps), ~2-day feel (default; vixFastDays)
+        Array<sint64, 256>  vixSlow;            // slow volatility EWMA (bps), ~1-week baseline (default; vixSlowDays)
         Array<sint64, 256>  vixLastPrice;       // last sampled Qswap price (basis for the next move)
-        Array<uint32, 256>  vixLastSampleTick;  // tick of the last VIX sample (8h cadence timer)
+        Array<uint32, 256>  vixLastSampleTick;  // tick of the last VIX sample (daily-cadence timer by default)
         Array<uint16, 256>  vixSampleCount;     // samples taken (0 = none yet → just establish baseline)
         Array<uint8,  256>  vixBreakout;        // 1 = pool currently in a volatility breakout
         sint64 vixBreakoutFactor;  // breakout multiplier ×100 (200 = 2.00×); governable via PROP_TYPE_UPDATE_VIX_FACTOR
         sint64 vixAbsFloorBps;     // min fast vol (bps) to count as a breakout; governable via PROP_TYPE_UPDATE_VIX_FLOOR
         uint32 vixSampleInterval;  // ticks between VIX pulses (345600=1/day default, 172800=2/day, 115200=3/day); governable via PROP_TYPE_UPDATE_VIX_PULSE_RATE
+        uint32 vixFastDays;        // VIX fast EWMA horizon in days; default 2; governable 2/3/4/5 via PROP_TYPE_UPDATE_VIX_FAST_DAYS
+        uint32 vixSlowDays;        // VIX slow EWMA horizon in days; default 7 (1 week); governable 1/2/3/4 weeks (x7) via PROP_TYPE_UPDATE_VIX_SLOW_WEEKS
+        uint32 swingCadenceDays;   // Cloak per-pool check cadence in days; default 30 (~monthly); governable 30/20/10/5 via PROP_TYPE_UPDATE_SWING_CADENCE
+        // --- Self-healing tick-rate calibration (all timers scale off dayTicks) ---
+        uint32 dayTicks;           // live smoothed ticks-per-day; default VIX_DAY_TICKS (345600 = 4/sec); clamped to [DAYTICKS_MIN, DAYTICKS_MAX]
+        uint32 tickRatePinnedSec;  // governance emergency pin: 0 = auto/self-heal (default); 1..40 = dayTicks frozen at this ticks/sec (PROP_TYPE_UPDATE_TICKRATE_PIN)
+        uint32 calibAnchorTick;    // tick# of the current measurement anchor
+        uint8  calibReady;         // 0 until the first anchor is set (cold-start: dayTicks holds the default meanwhile)
+        DateAndTime calibAnchorTime; // consensus-clock timestamp captured at the anchor tick; diffed against qpi.now() to measure elapsed real time
         sint64 swingSellPct;       // Cloak: % of a swing bag sold per rally-sell trigger (swingSellGainPct); default 50; governable via PROP_TYPE_UPDATE_SWING_SELL_PCT
         sint64 stopLossTriggerPct; // Cloak stop-loss: cut a bag once pool price <= avg cost × (100 - this)%; default 45; 0 = disabled; governable via PROP_TYPE_UPDATE_STOP_LOSS_TRIGGER
         sint64 stopLossSellPct;    // Cloak stop-loss: % of the losing bag sold per trigger; default 60; governable via PROP_TYPE_UPDATE_STOP_LOSS_SELL
@@ -829,6 +873,13 @@ struct CLKnDGR : public ContractBase
         state.mut().vixBreakoutFactor     = INITIAL_VIX_BREAKOUT_FACTOR; // 2.00×; governable via PROP_TYPE_UPDATE_VIX_FACTOR
         state.mut().vixAbsFloorBps         = INITIAL_VIX_ABS_FLOOR_BPS;  // 25 bps; governable via PROP_TYPE_UPDATE_VIX_FLOOR
         state.mut().vixSampleInterval      = INITIAL_VIX_SAMPLE_INTERVAL; // 1 pulse/day; governable via PROP_TYPE_UPDATE_VIX_PULSE_RATE
+        state.mut().vixFastDays            = (uint32)INITIAL_VIX_FAST_DAYS; // 2 days; governable via PROP_TYPE_UPDATE_VIX_FAST_DAYS
+        state.mut().vixSlowDays            = (uint32)INITIAL_VIX_SLOW_DAYS; // 7 days (1 week); governable via PROP_TYPE_UPDATE_VIX_SLOW_WEEKS
+        state.mut().swingCadenceDays       = INITIAL_SWING_CADENCE_DAYS;    // 30 days (~monthly); governable via PROP_TYPE_UPDATE_SWING_CADENCE
+        state.mut().dayTicks               = VIX_DAY_TICKS;                 // start at the 4/sec reference (day-one behavior identical to a fixed contract)
+        state.mut().tickRatePinnedSec      = 0;                             // 0 = auto/self-heal; governance can pin via PROP_TYPE_UPDATE_TICKRATE_PIN
+        state.mut().calibAnchorTick        = 0;
+        state.mut().calibReady             = 0;                             // first BEGIN_TICK sets the anchor; dayTicks holds the default until a full window elapses
         state.mut().swingSellPct           = INITIAL_SWING_SELL_PCT;     // 50%; governable via PROP_TYPE_UPDATE_SWING_SELL_PCT
         state.mut().stopLossTriggerPct     = INITIAL_STOP_LOSS_TRIGGER_PCT; // 45% below avg cost; 0 disables; governable via PROP_TYPE_UPDATE_STOP_LOSS_TRIGGER
         state.mut().stopLossSellPct        = INITIAL_STOP_LOSS_SELL_PCT;    // sell 60% of the bag per trigger; governable via PROP_TYPE_UPDATE_STOP_LOSS_SELL
@@ -881,9 +932,10 @@ struct CLKnDGR : public ContractBase
 
         // --- Select active payout percentages from the governance-chosen preset ---
         // Safety valve: if the execution-fee reserve has fallen below the governable floor, this epoch
-        // automatically runs the RECOVERY preset (3) regardless of the chosen preset — routing ALL
-        // profit into the reserve and suspending the shareholder / Qearn / dev-fund / CCF payouts until
-        // it recovers. The contract keeps trading normally. Shareholders can also select preset 3 via
+        // automatically runs the RECOVERY preset (3) regardless of the chosen preset — routing 70% of
+        // profit into the reserve (the other 30% stays as depositor trading capital) and suspending the
+        // shareholder / Qearn / dev-fund / CCF payouts until it recovers. The contract keeps trading
+        // normally. Shareholders can also select preset 3 via
         // UPDATE_PAYOUT. Computed here, upstream of the Qearn-NAV pre-computation below, so the NAV
         // exclusion uses the same (possibly overridden) Qearn percentage as the actual split.
         locals.feeReserveNow = qpi.queryFeeReserve(CLKnDGR_CONTRACT_INDEX);
@@ -958,7 +1010,7 @@ struct CLKnDGR : public ContractBase
             // for active depositors, so none may lift the share price. The payout slices are subtracted here
             // (before the split actually pays them out) so the NAV grows ONLY on the retained remainder;
             // omitting them over-credits depositors by that amount every profit epoch (proven by the
-            // NAV_DepositorPoolStaysBackedAcrossProfitEpoch test — full profit in limp mode, ~42% on preset 0).
+            // NAV_DepositorPoolStaysBackedAcrossProfitEpoch test — ~42% NAV growth on a preset-0 profit epoch).
             qpi.getEntity(SELF, locals.entity);
             locals.vaultCurBalance = (sint64)(locals.entity.incomingAmount - locals.entity.outgoingAmount)
                                      - state.get().quReserve
@@ -972,17 +1024,52 @@ struct CLKnDGR : public ContractBase
                                      - state.get().reserveSellProceeds;
             if (locals.vaultCurBalance > 0)
             {
-                // Proportional update: new depositorPool = old × (current / prev)
-                // Overflow-safe: scale by 1000 (not 1,000,000) so vaultCurBalance * 1000
-                // fits in uint64 for any balance up to the full QU supply (~10^15 QU):
-                //   10^15 × 1000 = 10^18 < uint64 max (1.84 × 10^19).
-                // Cap navRatio at 9000 (9× per-epoch gain) so the second multiply
-                //   totalDepositorPool × navRatio ≤ 10^15 × 9000 = 9 × 10^18 < uint64 max.
-                locals.navRatio = div((uint64)locals.vaultCurBalance * 1000ULL,
-                                      (uint64)state.get().prevTradingBalance);
-                if (locals.navRatio > 9000ULL) { locals.navRatio = 9000ULL; }
-                locals.vaultNewPool = (sint64)div((uint64)state.get().totalDepositorPool * locals.navRatio,
-                                                  1000ULL);
+                // Precise proportional update: newPool = pool + pool × (curBalance − prevBalance) / prevBalance.
+                // The prior form (navRatio = curBalance × 1000 / prevBalance, then pool × navRatio / 1000)
+                // FLOORED any per-epoch gain below 0.1% to ZERO — so under realistic returns (~0.05%/epoch)
+                // the depositor pool and share price never grew and depositors earned NONE of the trading
+                // profit (it piled up as uncredited backing). This form credits the full gain (or loss),
+                // however small, while staying overflow-safe with 64-bit math.
+                locals.vaultGain = locals.vaultCurBalance - state.get().prevTradingBalance; // >0 profit, <0 loss
+                // Guard: cap a single epoch's POSITIVE gain at +8× prior backing (preserves the old 9× ceiling
+                // on per-epoch pool growth; an extreme one-off windfall cannot over-credit in a single step).
+                if (locals.vaultGain > 0 &&
+                    (uint64)locals.vaultGain > 8ULL * (uint64)state.get().prevTradingBalance)
+                {
+                    locals.vaultGain = (sint64)(8ULL * (uint64)state.get().prevTradingBalance);
+                }
+                locals.vaultAbsGain = (locals.vaultGain < 0) ? -locals.vaultGain : locals.vaultGain;
+                // poolDelta = pool × vaultAbsGain / prevBalance, overflow-safe for ANY magnitude: split
+                // vaultAbsGain into whole multiples of prevBalance (≤8 after the cap → pool × int stays in
+                // range) plus a remainder < prevBalance. The remainder term multiplies first when it fits,
+                // else falls back to reciprocal division (a negligible rounding only reachable on an extreme
+                // capped gain). pool ≤ prevBalance (solvency invariant) keeps every intermediate bounded.
+                locals.vaultPoolDelta = 0;
+                if (locals.vaultAbsGain > 0 && state.get().totalDepositorPool > 0)
+                {
+                    locals.vaultRatioInt = div((uint64)locals.vaultAbsGain, (uint64)state.get().prevTradingBalance);
+                    locals.vaultRatioRem = (uint64)locals.vaultAbsGain
+                                           - locals.vaultRatioInt * (uint64)state.get().prevTradingBalance;
+                    locals.vaultPoolDelta = (sint64)((uint64)state.get().totalDepositorPool * locals.vaultRatioInt);
+                    if (locals.vaultRatioRem > 0)
+                    {
+                        if ((uint64)state.get().totalDepositorPool <= div(0xFFFFFFFFFFFFFFFFULL, locals.vaultRatioRem))
+                        {
+                            locals.vaultPoolDelta = locals.vaultPoolDelta + (sint64)div(
+                                (uint64)state.get().totalDepositorPool * locals.vaultRatioRem,
+                                (uint64)state.get().prevTradingBalance);
+                        }
+                        else
+                        {
+                            locals.vaultPoolDelta = locals.vaultPoolDelta + (sint64)div(
+                                (uint64)state.get().totalDepositorPool,
+                                div((uint64)state.get().prevTradingBalance, locals.vaultRatioRem));
+                        }
+                    }
+                }
+                if (locals.vaultGain < 0) { locals.vaultPoolDelta = -locals.vaultPoolDelta; }
+                locals.vaultNewPool = state.get().totalDepositorPool + locals.vaultPoolDelta;
+                if (locals.vaultNewPool < 0) { locals.vaultNewPool = 0; }
                 state.mut().totalDepositorPool = locals.vaultNewPool;
                 // Recompute share price from updated pool (shares outstanding is unchanged)
                 state.mut().vaultSharePrice = div((uint64)state.get().totalDepositorPool,
@@ -1559,7 +1646,7 @@ struct CLKnDGR : public ContractBase
                     {
                         state.mut().poolActive.set(locals.prop.poolIndex, 1);
                         // Clear any stale Dagger cooldown — a pool reactivated after a long absence
-                        // may have had a 5-week unaffordable cooldown set before removal. Without
+                        // may have had a 6.25-week unaffordable cooldown set before removal. Without
                         // this reset, the pool would silently sit locked for the remainder of that
                         // cooldown with no visible indication to operators.
                         state.mut().poolCooldownTick.set(locals.prop.poolIndex, 0);
@@ -1703,6 +1790,51 @@ struct CLKnDGR : public ContractBase
                     {
                         // store the interval in ticks (1/day=345600, 2/day=172800, 3/day=115200)
                         state.mut().vixSampleInterval = (uint32)div((uint64)VIX_DAY_TICKS, (uint64)locals.prop.newValue);
+                    }
+                }
+                else if (locals.prop.proposalType == PROP_TYPE_UPDATE_VIX_FAST_DAYS)
+                {
+                    // VIX fast EWMA horizon in days (smaller = more reactive): 2/3/4/5.
+                    if (locals.prop.newValue == 2LL || locals.prop.newValue == 3LL ||
+                        locals.prop.newValue == 4LL || locals.prop.newValue == 5LL)
+                    {
+                        state.mut().vixFastDays = (uint32)locals.prop.newValue;
+                    }
+                }
+                else if (locals.prop.proposalType == PROP_TYPE_UPDATE_VIX_SLOW_WEEKS)
+                {
+                    // VIX slow EWMA baseline in weeks -> stored x7 days: 1wk=7, 2wk=14, 3wk=21, 4wk=28.
+                    if (locals.prop.newValue == 1LL || locals.prop.newValue == 2LL ||
+                        locals.prop.newValue == 3LL || locals.prop.newValue == 4LL)
+                    {
+                        state.mut().vixSlowDays = (uint32)(locals.prop.newValue * 7LL);
+                    }
+                }
+                else if (locals.prop.proposalType == PROP_TYPE_UPDATE_SWING_CADENCE)
+                {
+                    // Cloak per-pool check cadence in days: 5/10/20/30.
+                    if (locals.prop.newValue == 5LL  || locals.prop.newValue == 10LL ||
+                        locals.prop.newValue == 20LL || locals.prop.newValue == 30LL)
+                    {
+                        state.mut().swingCadenceDays = (uint32)locals.prop.newValue;
+                    }
+                }
+                else if (locals.prop.proposalType == PROP_TYPE_UPDATE_TICKRATE_PIN)
+                {
+                    // Emergency seatbelt for the self-healing tick rate: 0 = auto/self-heal, 1..40 = pin ticks/sec.
+                    if (locals.prop.newValue >= 0LL && locals.prop.newValue <= TICKRATE_PIN_MAX_SPS)
+                    {
+                        state.mut().tickRatePinnedSec = (uint32)locals.prop.newValue;
+                        if (locals.prop.newValue == 0LL)
+                        {
+                            // Back to auto: force a fresh calibration anchor so the next window measures cleanly.
+                            state.mut().calibReady = 0;
+                        }
+                        else
+                        {
+                            // Pin immediately (BEGIN_TICK also re-freezes it every tick while pinned).
+                            state.mut().dayTicks = (uint32)((uint64)locals.prop.newValue * 86400ULL);
+                        }
                     }
                 }
                 else if (locals.prop.proposalType == PROP_TYPE_UPDATE_SWING_SELL_PCT)
@@ -1957,6 +2089,109 @@ struct CLKnDGR : public ContractBase
 
             state.mut().proposals.set(locals.i, locals.prop);
         }
+
+        // ---------------------------------------------------------------
+        // Deferred DELETE_POOL pass (PROP_TYPE_DELETE_POOL) — runs AFTER the main proposal loop.
+        // Passed DELETE_POOL proposals only get status=PASSED above; the slot-reclaim happens HERE so
+        // a delete's array-compaction can never shift the poolIndex of another proposal executed this
+        // epoch (REMOVE / REACTIVATE / SELL / WITHDRAW all ran above on stable indices). Deletes are
+        // applied highest poolIndex first (descending) — freeing a higher slot never shifts a still-
+        // pending lower one — and the deactivated+empty guard is RE-CHECKED here (defensive). Compaction
+        // is swap-and-shrink: the last pool moves into the freed slot, then poolCount--, so the deleted
+        // pool leaves the every-tick scan for good. The vacated tail slot is zeroed so a future ADD_POOL
+        // reusing that index gets a clean, fresh pool.
+        locals.delDoneMask = 0;
+        while (state.get().poolCount > 0)
+        {
+            locals.delSlot   = 0xFFFF;
+            locals.delTarget = -1;
+            for (locals.i = 0; locals.i < (uint64)state.get().proposalsThisEpoch; locals.i = locals.i + 1)
+            {
+                if ((locals.delDoneMask & (uint16)(1ULL << locals.i)) != 0)               { continue; } // already applied
+                locals.prop = state.get().proposals.get(locals.i);
+                if (locals.prop.proposalType != PROP_TYPE_DELETE_POOL)                    { continue; }
+                if (locals.prop.status       != PROP_STATUS_PASSED)                       { continue; }
+                if (locals.prop.poolIndex >= (uint64)state.get().poolCount)               { continue; } // stale / out of range
+                if ((sint64)locals.prop.poolIndex <= locals.delTarget)                    { continue; } // want the highest
+                // Guard re-check: pool must STILL be deactivated AND fully empty.
+                if (state.get().poolActive.get(locals.prop.poolIndex))                    { continue; }
+                if (state.get().poolReserveTokens.get(locals.prop.poolIndex)       != 0)  { continue; }
+                if (state.get().swingTokens.get(locals.prop.poolIndex)             != 0)  { continue; }
+                if (state.get().poolPendingRecoveryAmt.get(locals.prop.poolIndex)  != 0)  { continue; }
+                if (state.get().swingPendingRecoveryAmt.get(locals.prop.poolIndex) != 0)  { continue; }
+                locals.delTarget = (sint64)locals.prop.poolIndex;
+                locals.delSlot   = (uint16)locals.i;
+            }
+            if (locals.delSlot == 0xFFFF) { break; } // no more valid deletes
+            locals.delDoneMask = (uint16)(locals.delDoneMask | (uint16)(1ULL << (uint64)locals.delSlot));
+
+            locals.delIdx  = (uint64)locals.delTarget;
+            locals.delLast = (uint64)state.get().poolCount - 1ULL;
+            if (locals.delIdx != locals.delLast)
+            {
+                // Move the last pool's FULL per-pool state into the freed slot (all 25 per-pool arrays).
+                state.mut().poolAssetNames.set(locals.delIdx, state.get().poolAssetNames.get(locals.delLast));
+                state.mut().poolIssuers.set(locals.delIdx, state.get().poolIssuers.get(locals.delLast));
+                state.mut().poolActive.set(locals.delIdx, state.get().poolActive.get(locals.delLast));
+                state.mut().poolReserveTokens.set(locals.delIdx, state.get().poolReserveTokens.get(locals.delLast));
+                state.mut().poolReserveCostBasis.set(locals.delIdx, state.get().poolReserveCostBasis.get(locals.delLast));
+                state.mut().poolCooldownTick.set(locals.delIdx, state.get().poolCooldownTick.get(locals.delLast));
+                state.mut().poolCooldownTickA.set(locals.delIdx, state.get().poolCooldownTickA.get(locals.delLast));
+                state.mut().poolPendingRecoveryAmt.set(locals.delIdx, state.get().poolPendingRecoveryAmt.get(locals.delLast));
+                state.mut().poolPendingRecoverySource.set(locals.delIdx, state.get().poolPendingRecoverySource.get(locals.delLast));
+                state.mut().poolPendingRecoveryCostBasis.set(locals.delIdx, state.get().poolPendingRecoveryCostBasis.get(locals.delLast));
+                state.mut().swingPriceHead.set(locals.delIdx, state.get().swingPriceHead.get(locals.delLast));
+                state.mut().swingPriceCount.set(locals.delIdx, state.get().swingPriceCount.get(locals.delLast));
+                state.mut().swingTokens.set(locals.delIdx, state.get().swingTokens.get(locals.delLast));
+                state.mut().swingCostBasis.set(locals.delIdx, state.get().swingCostBasis.get(locals.delLast));
+                state.mut().swingCooldownTick.set(locals.delIdx, state.get().swingCooldownTick.get(locals.delLast));
+                state.mut().swingPendingRecoveryAmt.set(locals.delIdx, state.get().swingPendingRecoveryAmt.get(locals.delLast));
+                state.mut().swingPendingRecoveryCost.set(locals.delIdx, state.get().swingPendingRecoveryCost.get(locals.delLast));
+                state.mut().swingPendingRecoverySource.set(locals.delIdx, state.get().swingPendingRecoverySource.get(locals.delLast));
+                state.mut().vixFast.set(locals.delIdx, state.get().vixFast.get(locals.delLast));
+                state.mut().vixSlow.set(locals.delIdx, state.get().vixSlow.get(locals.delLast));
+                state.mut().vixLastPrice.set(locals.delIdx, state.get().vixLastPrice.get(locals.delLast));
+                state.mut().vixLastSampleTick.set(locals.delIdx, state.get().vixLastSampleTick.get(locals.delLast));
+                state.mut().vixSampleCount.set(locals.delIdx, state.get().vixSampleCount.get(locals.delLast));
+                state.mut().vixBreakout.set(locals.delIdx, state.get().vixBreakout.get(locals.delLast));
+                for (locals.delS = 0; locals.delS < (uint64)SWING_PRICE_SLOTS; locals.delS = locals.delS + 1)
+                {
+                    state.mut().swingPriceHistory.set(
+                        locals.delIdx  * (uint64)SWING_PRICE_SLOTS + locals.delS,
+                        state.get().swingPriceHistory.get(locals.delLast * (uint64)SWING_PRICE_SLOTS + locals.delS));
+                }
+            }
+            // Zero the now-vacated tail slot so a future ADD_POOL reusing this index starts clean.
+            state.mut().poolAssetNames.set(locals.delLast, 0);
+            state.mut().poolIssuers.set(locals.delLast, NULL_ID);
+            state.mut().poolActive.set(locals.delLast, 0);
+            state.mut().poolReserveTokens.set(locals.delLast, 0);
+            state.mut().poolReserveCostBasis.set(locals.delLast, 0);
+            state.mut().poolCooldownTick.set(locals.delLast, 0);
+            state.mut().poolCooldownTickA.set(locals.delLast, 0);
+            state.mut().poolPendingRecoveryAmt.set(locals.delLast, 0);
+            state.mut().poolPendingRecoverySource.set(locals.delLast, 0);
+            state.mut().poolPendingRecoveryCostBasis.set(locals.delLast, 0);
+            state.mut().swingPriceHead.set(locals.delLast, 0);
+            state.mut().swingPriceCount.set(locals.delLast, 0);
+            state.mut().swingTokens.set(locals.delLast, 0);
+            state.mut().swingCostBasis.set(locals.delLast, 0);
+            state.mut().swingCooldownTick.set(locals.delLast, 0);
+            state.mut().swingPendingRecoveryAmt.set(locals.delLast, 0);
+            state.mut().swingPendingRecoveryCost.set(locals.delLast, 0);
+            state.mut().swingPendingRecoverySource.set(locals.delLast, 0);
+            state.mut().vixFast.set(locals.delLast, 0);
+            state.mut().vixSlow.set(locals.delLast, 0);
+            state.mut().vixLastPrice.set(locals.delLast, 0);
+            state.mut().vixLastSampleTick.set(locals.delLast, 0);
+            state.mut().vixSampleCount.set(locals.delLast, 0);
+            state.mut().vixBreakout.set(locals.delLast, 0);
+            for (locals.delS = 0; locals.delS < (uint64)SWING_PRICE_SLOTS; locals.delS = locals.delS + 1)
+            {
+                state.mut().swingPriceHistory.set(locals.delLast * (uint64)SWING_PRICE_SLOTS + locals.delS, 0);
+            }
+            state.mut().poolCount = (uint8)locals.delLast; // poolCount - 1
+        }
     }
 
     // ---------------------------------------------------------------
@@ -1967,6 +2202,55 @@ struct CLKnDGR : public ContractBase
         qpi.getEntity(SELF, locals.entity);
         state.mut().quBalance = locals.entity.incomingAmount - locals.entity.outgoingAmount;
 
+        // ---------------------------------------------------------------
+        // Self-healing tick-rate calibration — keep dayTicks tracking the REAL tick speed so every
+        // duration timer (which scales by dayTicks / VIX_DAY_TICKS) holds its real-world meaning even
+        // if the network's ticks/sec changes. Runs every tick (before the no-pools return) so timing
+        // stays fresh. qpi.now() is the DETERMINISTIC consensus clock, so every computor computes an
+        // identical dayTicks. GUARDRAILS: emergency governance pin, 1..40 tick/sec clamp, ~1-week EWMA
+        // smoothing, div-0 + overflow + anomalous-gap guards, and cold-start at the 4/sec reference.
+        // ---------------------------------------------------------------
+        if (state.get().tickRatePinnedSec != 0)
+        {
+            // Emergency governance pin (seatbelt): freeze dayTicks at the pinned ticks/sec; no measurement.
+            state.mut().dayTicks = (uint32)((uint64)state.get().tickRatePinnedSec * 86400ULL);
+        }
+        else if (state.get().calibReady == 0)
+        {
+            // Cold-start: set the first anchor. dayTicks holds its default until a full window elapses.
+            state.mut().calibAnchorTick = qpi.tick();
+            state.mut().calibAnchorTime = qpi.now();
+            state.mut().calibReady      = 1;
+        }
+        else if ((uint32)(qpi.tick() - state.get().calibAnchorTick) >= CALIB_WINDOW_TICKS)
+        {
+            locals.calibDeltaTicks      = (uint64)(uint32)(qpi.tick() - state.get().calibAnchorTick);
+            locals.calibElapsedMicrosec = state.get().calibAnchorTime.durationMicrosec(qpi.now());
+            // Guards: skip a zero/invalid elapsed (div() is zero-safe anyway) and an anomalous gap
+            // (deltaTicks < 2e8 keeps deltaTicks × MICROSEC_PER_DAY well inside uint64).
+            if (locals.calibElapsedMicrosec != 0 && locals.calibElapsedMicrosec != 0xFFFFFFFFFFFFFFFFULL &&
+                locals.calibDeltaTicks < 200000000ULL)
+            {
+                // raw ticks/day = deltaTicks × µs-per-day ÷ elapsed-µs.
+                locals.calibRawDayTicks = div(locals.calibDeltaTicks * MICROSEC_PER_DAY, locals.calibElapsedMicrosec);
+                // Glitch filter: only fold in a reading inside the accepted 1..40 ticks/sec band.
+                if (locals.calibRawDayTicks >= (uint64)DAYTICKS_MIN && locals.calibRawDayTicks <= (uint64)DAYTICKS_MAX)
+                {
+                    // EWMA (α = 1/TICKRATE_EWMA_DIV → ~1 week to converge): new = (old×(D-1) + raw) / D.
+                    locals.calibNewDayTicks = div(
+                        (uint64)state.get().dayTicks * (TICKRATE_EWMA_DIV - 1ULL) + locals.calibRawDayTicks,
+                        TICKRATE_EWMA_DIV);
+                    if (locals.calibNewDayTicks < (uint64)DAYTICKS_MIN) { locals.calibNewDayTicks = (uint64)DAYTICKS_MIN; }
+                    if (locals.calibNewDayTicks > (uint64)DAYTICKS_MAX) { locals.calibNewDayTicks = (uint64)DAYTICKS_MAX; }
+                    state.mut().dayTicks = (uint32)locals.calibNewDayTicks;
+                }
+                // else: out-of-band reading discarded (dayTicks unchanged); still re-anchor below.
+            }
+            // Re-anchor for the next window (ALWAYS — a bad/anomalous reading can never wedge the anchor).
+            state.mut().calibAnchorTick = qpi.tick();
+            state.mut().calibAnchorTime = qpi.now();
+        }
+
         // Subtract earmarked reserves from the available trading balance.
         // quReserve (dev fund) and qearnReserve (Qearn accumulator) are virtual accounting
         // counters — they sit in the same on-chain balance and would otherwise be silently
@@ -1974,16 +2258,17 @@ struct CLKnDGR : public ContractBase
         locals.tradingBalance = state.get().quBalance - state.get().quReserve - state.get().qearnReserve - state.get().waitlistQu;
         if (locals.tradingBalance < 0) { locals.tradingBalance = 0; }
         // Snapshot before any Cloak or Dagger deductions. Used by the Dagger unaffordable-cooldown
-        // check to distinguish "vault is underfunded" (5-week cooldown) from "Cloak spent it this
+        // check to distinguish "vault is underfunded" (6.25-week cooldown) from "Cloak spent it this
         // tick" (no cooldown penalty — try again next tick).
         locals.initialTradingBalance = locals.tradingBalance;
 
         if (state.get().poolCount == 0)                          { return; }
 
         // NOTE: the fee-reserve safety valve does NOT pause trading. The contract keeps trading
-        // normally in every tick; when the execution-fee reserve is low it instead routes 100% of its
-        // profit to the reserve via the RECOVERY preset at BEGIN_EPOCH (see the dispatch there), so it
-        // rebuilds the fee budget from its own earnings rather than by sitting idle.
+        // normally in every tick; when the execution-fee reserve is low it instead routes 70% of its
+        // profit to the reserve via the RECOVERY preset at BEGIN_EPOCH (the other 30% stays as depositor
+        // trading capital; see the dispatch there), so it rebuilds the fee budget from its own earnings
+        // rather than by sitting idle.
 
         // ---------------------------------------------------------------
         // Recovery pass: retry TSRM for pools where Leg-2 failed last tick.
@@ -2066,10 +2351,11 @@ struct CLKnDGR : public ContractBase
         }
 
         // ==============================================================
-        // THE CLOAK — swing trade strategy (runs before the dagger)
-        // Entry: 1-week avg price <= 3-month avg × 90% → buy 1% of trading capital on Qswap
-        // Exit:  pool price >= cost per token × 112% → sell 20% of position on QX
-        // Cooldown: 25 hours after any buy or sell action
+        // THE CLOAK — swing trade strategy (runs before the dagger). The numbers below are the DEFAULTS;
+        // the dip depth, sell trigger, sell chunk, and cadence are all governable (Types 27/28/21/32).
+        // Entry: 1-week avg price <= 3-month avg × 70% → buy 1% of trading capital on Qswap
+        // Exit:  pool price >= cost per token × 106% → sell 50% of position on QX
+        // Cooldown: ~30 days (monthly) after any buy or sell action
         // ==============================================================
 
         // --- Cloak recovery pass: retry TSRM for swing positions where rights transfer failed ---
@@ -2167,7 +2453,7 @@ struct CLKnDGR : public ContractBase
 
             // Monthly cadence: bump this pool's cooldown so it is re-evaluated about once a month,
             // whether or not it acts (idle / first buy / DCA-add / sell). One timer for the strategy.
-            state.mut().swingCooldownTick.set(locals.i, qpi.tick() + SWING_COOLDOWN_TICKS);
+            state.mut().swingCooldownTick.set(locals.i, qpi.tick() + (uint32)((uint64)state.get().swingCadenceDays * (uint64)state.get().dayTicks)); // days × live ticks/day (self-healing)
 
             // Is token A in a dip? (1-week avg <= 3-month avg - SWING_BUY_DIP_PCT%). Computed from the
             // FREE stored price history — used by BOTH the first buy (not holding) and the DCA-in add
@@ -2216,7 +2502,7 @@ struct CLKnDGR : public ContractBase
                     (uint64)state.get().swingCostBasis.get(locals.i),
                     (uint64)state.get().swingTokens.get(locals.i));
 
-                // Sell trigger: pool price >= cost per token × 112%
+                // Sell trigger: pool price >= cost per token × 106% (default +6%; uses swingSellGainPct)
                 // EC-C7: additive form avoids × 112 overflow (same class as EC-3)
                 if (locals.swingPoolPrice >= locals.swingCostPerToken +
                         (sint64)div((uint64)locals.swingCostPerToken * (uint64)state.get().swingSellGainPct, (uint64)100))
@@ -2411,7 +2697,7 @@ struct CLKnDGR : public ContractBase
                 // ==========================================================
                 // STOP-LOSS: cut a deep loser (downside exit)
                 // ==========================================================
-                // The +12% gain trigger above didn't fire. If this bag has instead fallen to avg cost ×
+                // The +6% gain trigger above didn't fire. If this bag has instead fallen to avg cost ×
                 // (100 - stopLossTriggerPct)% or below, liquidate stopLossSellPct% of it on Qswap. Qswap
                 // (the AMM) always fills and returns the QU in-tick, so we split the salvage immediately:
                 // STOP_LOSS_EXEC_PCT (10%) is burned to the execution-fee reserve and the remaining ~90%
@@ -2594,7 +2880,7 @@ struct CLKnDGR : public ContractBase
         if (locals.tradingBalance < state.get().minProfitQu) { return; }
 
         // ==============================================================
-        // VIX sampler — cheap 3×/day volatility pulse that gates the Dagger.
+        // VIX sampler — cheap ~1×/day volatility pulse (default) that gates the Dagger.
         // For each active pool, at most every vixSampleInterval ticks (governable pulse rate), take ONE light Qswap
         // pool read, update the fast/slow volatility EWMAs from the % price move, and flag a breakout
         // (fast >= slow × factor AND fast >= floor). On a breakout, wake BOTH Dagger directions for
@@ -2604,10 +2890,10 @@ struct CLKnDGR : public ContractBase
         for (locals.i = 0; locals.i < (uint64)state.get().poolCount; locals.i = locals.i + 1)
         {
             if (!state.get().poolActive.get(locals.i)) { continue; }
-            // 8h cadence. First sample (count==0) runs immediately to seed a baseline. Unsigned tick
+            // Daily cadence (default). First sample (count==0) runs immediately to seed a baseline. Unsigned tick
             // subtraction is wraparound-safe (elapsed >= interval) for any gap up to the uint32 range.
             if (state.get().vixSampleCount.get(locals.i) != 0 &&
-                (uint32)((uint32)qpi.tick() - state.get().vixLastSampleTick.get(locals.i)) < state.get().vixSampleInterval)
+                (uint32)((uint32)qpi.tick() - state.get().vixLastSampleTick.get(locals.i)) < (uint32)((uint64)state.get().vixSampleInterval * (uint64)state.get().dayTicks / (uint64)VIX_DAY_TICKS)) // scaled to real time (self-healing)
             {
                 continue;
             }
@@ -2638,11 +2924,11 @@ struct CLKnDGR : public ContractBase
             locals.vixMoveBps = (sint64)div((uint64)locals.vixDelta * 10000ULL, (uint64)state.get().vixLastPrice.get(locals.i));
             if (locals.vixMoveBps > VIX_MOVE_CAP_BPS) { locals.vixMoveBps = VIX_MOVE_CAP_BPS; }
 
-            // Derive the EWMA divisors from the live pulse rate so the TIME horizons stay fixed (≈5d / ≈4wk)
+            // Derive the EWMA divisors from the live pulse rate so the TIME horizons stay fixed (≈2d / ≈1wk by default)
             // no matter how many pulses/day governance picks: divisor = horizon_days × pulses/day.
             locals.vixSpd     = (uint64)div((uint64)VIX_DAY_TICKS, (uint64)state.get().vixSampleInterval); // 1, 2, or 3
-            locals.vixFastDiv = VIX_FAST_DAYS * locals.vixSpd;
-            locals.vixSlowDiv = VIX_SLOW_DAYS * locals.vixSpd;
+            locals.vixFastDiv = (uint64)state.get().vixFastDays * locals.vixSpd;
+            locals.vixSlowDiv = (uint64)state.get().vixSlowDays * locals.vixSpd;
             // EWMA update, non-negative & overflow-safe: vix = (vix*(D-1) + move) / D.
             state.mut().vixFast.set(locals.i, (sint64)div(
                 (uint64)state.get().vixFast.get(locals.i) * (locals.vixFastDiv - 1ULL) + (uint64)locals.vixMoveBps,
@@ -2688,7 +2974,7 @@ struct CLKnDGR : public ContractBase
             if (state.get().poolPendingRecoverySource.get(locals.i) != 0) { continue; }
             // Adaptive no-arb cooldown: hunt fast (~5 min) while this pool is in a VIX breakout, else
             // sleep on the long baseline (~2 weeks). The VIX sampler wakes a fresh breakout (above).
-            locals.cooldownNoArb = state.get().vixBreakout.get(locals.i) ? state.get().breakoutRescanTicks : COOLDOWN_TICKS_BASELINE;
+            locals.cooldownNoArb = (uint32)((uint64)(state.get().vixBreakout.get(locals.i) ? state.get().breakoutRescanTicks : COOLDOWN_TICKS_BASELINE) * (uint64)state.get().dayTicks / (uint64)VIX_DAY_TICKS); // scaled to real time (self-healing)
 
             // --- Read Qswap pool state ---
             locals.poolIn.assetIssuer = state.get().poolIssuers.get(locals.i);
@@ -2720,13 +3006,13 @@ struct CLKnDGR : public ContractBase
             }
             if (locals.addBidIn.numberOfShares <= 0)
             {
-                // Only apply the 5-week unaffordable cooldown when the vault itself was underfunded
+                // Only apply the 6.25-week unaffordable cooldown when the vault itself was underfunded
                 // at tick start (before Cloak ran). If initialTradingBalance could afford ≥1 share
                 // but Cloak depleted capital mid-tick, skip without penalizing the pool — it will
                 // be eligible again next tick once tradingBalance is replenished.
                 if (div((uint64)locals.initialTradingBalance, (uint64)locals.askOut.orders.get(0).price) == 0)
                 {
-                    state.mut().poolCooldownTick.set(locals.i, qpi.tick() + COOLDOWN_TICKS_UNAFFORDABLE);
+                    state.mut().poolCooldownTick.set(locals.i, qpi.tick() + (uint32)((uint64)COOLDOWN_TICKS_UNAFFORDABLE * (uint64)state.get().dayTicks / (uint64)VIX_DAY_TICKS)); // scaled to real time (self-healing)
                 }
                 continue;
             }
@@ -2760,7 +3046,7 @@ struct CLKnDGR : public ContractBase
                 {
                     locals.addBidIn.numberOfShares = (sint64)div((uint64)locals.addBidIn.numberOfShares, (uint64)locals.scaleFactor);
                     // Scale-down integer-divided to 0 (e.g., affordableShares=3, scaleFactor=5).
-                    // Set 6.25-day cooldown so the pool is not re-checked every tick in a tight loop.
+                    // Set the adaptive no-arb cooldown (breakout: ~5-min re-scan; calm: ~2-week baseline) so the pool is not re-checked every tick in a tight loop.
                     if (locals.addBidIn.numberOfShares <= 0) { state.mut().poolCooldownTick.set(locals.i, qpi.tick() + locals.cooldownNoArb); continue; }
                     locals.quCostOnQx = (sint64)((uint64)locals.addBidIn.numberOfShares * (uint64)locals.askOut.orders.get(0).price);
                 }
@@ -2897,7 +3183,7 @@ struct CLKnDGR : public ContractBase
             }
             else
             {
-                // No profitable arb found on Qswap: pause checks for 5 days
+                // No profitable arb found on Qswap: pause checks (adaptive — ~5-min re-scan in a VIX breakout, else ~2-week baseline)
                 state.mut().poolCooldownTick.set(locals.i, qpi.tick() + locals.cooldownNoArb);
             }
         }
@@ -2925,7 +3211,7 @@ struct CLKnDGR : public ContractBase
             // Direction A spends QU to buy on Qswap, so it requires minimum trading capital.
             if (locals.tradingBalance < state.get().minProfitQu) { continue; }
             // Adaptive no-arb cooldown (same as Direction B): breakout → fast re-scan, calm → baseline.
-            locals.cooldownNoArb = state.get().vixBreakout.get(locals.i) ? state.get().breakoutRescanTicks : COOLDOWN_TICKS_BASELINE;
+            locals.cooldownNoArb = (uint32)((uint64)(state.get().vixBreakout.get(locals.i) ? state.get().breakoutRescanTicks : COOLDOWN_TICKS_BASELINE) * (uint64)state.get().dayTicks / (uint64)VIX_DAY_TICKS); // scaled to real time (self-healing)
 
             // --- Read Qswap pool state ---
             locals.poolIn.assetIssuer = state.get().poolIssuers.get(locals.i);
@@ -3122,7 +3408,7 @@ struct CLKnDGR : public ContractBase
             }
             else
             {
-                // No profitable Direction A arb: pause checks for 5 days.
+                // No profitable Direction A arb: pause checks (adaptive — ~5-min re-scan in a VIX breakout, else ~2-week baseline).
                 state.mut().poolCooldownTickA.set(locals.i, qpi.tick() + locals.cooldownNoArb);
             }
         }
@@ -3175,7 +3461,7 @@ struct CLKnDGR : public ContractBase
 
         // Validate proposal type — full refund on rejection (mirrors the insufficient-fee path below).
         if (input.proposalType < PROP_TYPE_ADD_POOL ||
-            input.proposalType > PROP_TYPE_UPDATE_SWING_RALLY)
+            input.proposalType > PROP_TYPE_UPDATE_TICKRATE_PIN)
         {
             if (qpi.invocationReward() > 0) { qpi.transfer(qpi.invocator(), qpi.invocationReward()); }
             return;
@@ -3240,6 +3526,25 @@ struct CLKnDGR : public ContractBase
         {
             if (input.poolIndex >= (uint64)state.get().poolCount) { locals.contentValid = 0; }
             if (locals.contentValid && state.get().poolActive.get(input.poolIndex)) { locals.contentValid = 0; } // already active
+        }
+        if (locals.contentValid && input.proposalType == PROP_TYPE_DELETE_POOL)
+        {
+            // DELETE_POOL frees a pool's slot PERMANENTLY (the END_EPOCH handler compacts the pool
+            // arrays and shrinks poolCount, removing the pool from the every-tick scan). GUARD: the pool
+            // must ALREADY be
+            //   (1) deactivated (via REMOVE_POOL), and
+            //   (2) fully emptied — no reserve tokens, no open swing position, nothing pending in
+            //       recovery (via WITHDRAW_ASSET_RESERVE / SELL_POOL_TOKENS first).
+            // This makes deletion a deliberate multi-vote process: deactivate -> withdraw -> delete.
+            // Intentionally slow: deletion is irreversible and re-indexes pools, so the extra scrutiny
+            // and time are wanted. ALL fund-handling stays in the prior votes; delete only reclaims an
+            // already-safe, empty slot. (The pool can be re-added later via ADD_POOL as a fresh pool.)
+            if (input.poolIndex >= (uint64)state.get().poolCount) { locals.contentValid = 0; }
+            if (locals.contentValid && state.get().poolActive.get(input.poolIndex))                    { locals.contentValid = 0; } // must be deactivated first
+            if (locals.contentValid && state.get().poolReserveTokens.get(input.poolIndex)        != 0) { locals.contentValid = 0; } // reserves must be withdrawn/sold
+            if (locals.contentValid && state.get().swingTokens.get(input.poolIndex)              != 0) { locals.contentValid = 0; } // no open Cloak position
+            if (locals.contentValid && state.get().poolPendingRecoveryAmt.get(input.poolIndex)   != 0) { locals.contentValid = 0; } // nothing stuck in Dagger recovery
+            if (locals.contentValid && state.get().swingPendingRecoveryAmt.get(input.poolIndex)  != 0) { locals.contentValid = 0; } // nothing stuck in Cloak recovery
         }
         if (locals.contentValid &&
             (input.proposalType == PROP_TYPE_UPDATE_PROPOSAL_FEE ||
@@ -3335,9 +3640,29 @@ struct CLKnDGR : public ContractBase
             // VIX pulses per day: more = sharper volatility detection, more execution-fee cost.
             if (input.newValue != 1LL && input.newValue != 2LL && input.newValue != 3LL) { locals.contentValid = 0; }
         }
+        if (locals.contentValid && input.proposalType == PROP_TYPE_UPDATE_VIX_FAST_DAYS)
+        {
+            // VIX fast EWMA horizon in days (smaller = more reactive): 2/3/4/5.
+            if (input.newValue != 2LL && input.newValue != 3LL && input.newValue != 4LL && input.newValue != 5LL) { locals.contentValid = 0; }
+        }
+        if (locals.contentValid && input.proposalType == PROP_TYPE_UPDATE_VIX_SLOW_WEEKS)
+        {
+            // VIX slow EWMA baseline in weeks (stored x7 days): 1/2/3/4.
+            if (input.newValue != 1LL && input.newValue != 2LL && input.newValue != 3LL && input.newValue != 4LL) { locals.contentValid = 0; }
+        }
+        if (locals.contentValid && input.proposalType == PROP_TYPE_UPDATE_SWING_CADENCE)
+        {
+            // Cloak per-pool check cadence in days (how often each pool is evaluated): 5/10/20/30.
+            if (input.newValue != 5LL && input.newValue != 10LL && input.newValue != 20LL && input.newValue != 30LL) { locals.contentValid = 0; }
+        }
+        if (locals.contentValid && input.proposalType == PROP_TYPE_UPDATE_TICKRATE_PIN)
+        {
+            // Tick-rate emergency pin: 0 = auto/self-heal, or a pinned 1..40 ticks/sec (matches the dayTicks band).
+            if (input.newValue < 0LL || input.newValue > TICKRATE_PIN_MAX_SPS) { locals.contentValid = 0; }
+        }
         if (locals.contentValid && input.proposalType == PROP_TYPE_UPDATE_SWING_SELL_PCT)
         {
-            // Cloak sell chunk: % of the bag sold each time the +12% trigger fires.
+            // Cloak sell chunk: % of the bag sold each time the +6% rally-sell trigger fires.
             if (input.newValue != 10LL && input.newValue != 15LL && input.newValue != 20LL &&
                 input.newValue != 25LL && input.newValue != 33LL && input.newValue != 50LL) { locals.contentValid = 0; }
         }
@@ -3397,7 +3722,8 @@ struct CLKnDGR : public ContractBase
                 if (input.proposalType == PROP_TYPE_REMOVE_POOL        ||
                     input.proposalType == PROP_TYPE_REACTIVATE_POOL    ||
                     input.proposalType == PROP_TYPE_WITHDRAW_ASSET_RESERVE ||
-                    input.proposalType == PROP_TYPE_SELL_POOL_TOKENS)
+                    input.proposalType == PROP_TYPE_SELL_POOL_TOKENS   ||
+                    input.proposalType == PROP_TYPE_DELETE_POOL)
                 {
                     if (locals.prop.poolIndex == input.poolIndex) { locals.contentValid = 0; }
                 }
