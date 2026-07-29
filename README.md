@@ -105,7 +105,7 @@ Each pool runs its own independent Cloak position. The contract holds one swing 
 
 The Dagger is a real-time cross-exchange arbitrage strategy. It identifies and captures price differences between QX (order book) and Qswap (AMM) in a single tick. It works in **both directions** — capturing the spread whichever way the price gap happens to lean.
 
-**Volatility-gated scanning (VIX).** Checking the exchanges costs execution fees, so the Dagger does not poll every pool constantly. Instead it keeps a cheap per-token **volatility index**, sampled from the Qswap pool once a day by default (governable to 2× or 3× via UPDATE_VIX_PULSE_RATE), that tracks how much each token is moving — a fast (≈5-day) reading against a slow (≈4-week) baseline. When a token's recent volatility breaks out above its own baseline, the Dagger wakes and hunts it at full speed (that's when cross-exchange gaps actually appear); when a token is calm it falls back to a sparse safety-net check. This concentrates the fee budget on tokens that are actually moving. The breakout sensitivity (UPDATE_VIX_FACTOR) and the minimum-movement floor (UPDATE_VIX_FLOOR) are both governable.
+**Volatility-gated scanning (VIX).** Checking the exchanges costs execution fees, so the Dagger does not poll every pool constantly. Instead it keeps a cheap per-token **volatility index**, sampled from the Qswap pool once a day by default (governable to 2× or 3× via UPDATE_VIX_PULSE_RATE), that tracks how much each token is moving — a fast (default 2-day) reading against a slow (default 1-week) baseline, both horizons separately governable via UPDATE_VIX_FAST_DAYS (Type 30) / UPDATE_VIX_SLOW_WEEKS (Type 31) and held in days (independent of the pulse rate). When a token's recent volatility breaks out above its own baseline, the Dagger wakes and hunts it at full speed (that's when cross-exchange gaps actually appear); when a token is calm it falls back to a sparse safety-net check. This concentrates the fee budget on tokens that are actually moving. The breakout sensitivity (UPDATE_VIX_FACTOR) and the minimum-movement floor (UPDATE_VIX_FLOOR) are both governable.
 
 **Direction B — buy QX, sell Qswap:** when the best *ask* on QX is cheaper than what Qswap would pay for the same tokens.
 - **Leg 1:** Buy tokens on QX at the best available ask price.
@@ -161,7 +161,7 @@ from it.
 | **0 — Default** | 55% | 30% | 3% | 10% | 1% | 1% |
 | **1 — Growth** | 61% | 27% | 3% | 7% | 1% | 1% |
 | **2 — Aggressive** | 65% | 25% | 3% | 5% | 1% | 1% |
-| **3 — Recovery** | 0% | 100% | 0% | 0% | 0% | 0% |
+| **3 — Recovery** | 30% | 70% | 0% | 0% | 0% | 0% |
 
 Preset 0 pays shareholders the most (10%) and funds execution moderately. Presets 1 and 2
 progressively steer more toward the trading pool and execution-fee funding, with a smaller
@@ -169,7 +169,8 @@ shareholder dividend (7% → 5%). The Qearn boost (3%), dev fund (1%), and CCF (
 across presets 0–2. Shareholders vote to change the active preset.
 
 **Preset 3 — Recovery / limp mode** is special: the contract **keeps trading normally** but routes
-**100% of its profit** into the execution-fee reserve, suspending the shareholder, Qearn, dev-fund, and
+**70% of its profit** into the execution-fee reserve while **still paying depositors the retained 30%**
+(their vault NAV keeps growing), suspending only the shareholder, Qearn, dev-fund, and
 CCF payouts — so it rebuilds its on-chain fee budget fast, from its own earnings. It is applied **automatically** whenever the execution-fee reserve falls
 below the governable floor (see UPDATE_EXEC_RESERVE_FLOOR), and shareholders can also select it
 manually. The contract returns to the chosen preset on its own **once the reserve climbs back to 10%
@@ -194,7 +195,7 @@ The depositor veto exists specifically so that large depositors cannot be harmed
 decisions without a meaningful check. Veto votes are re-validated at epoch end against the
 current NAV — a depositor who has lost significant value no longer qualifies.
 
-### Governable parameters (28 proposal types)
+### Governable parameters (33 proposal types)
 
 | # | Proposal | Fee | What it changes |
 |---|---|---|---|
@@ -213,11 +214,11 @@ current NAV — a depositor who has lost significant value no longer qualifies.
 | 13 | **UPDATE_RESERVE_PROFIT_PCT** | 50M QU | Changes the minimum profit percentage required before the contract sells accumulated token reserves. Valid values: 2%, 5%, 7%, or 10%. |
 | 14 | **UPDATE_DEPOSITOR_VOTE_MIN** | 50M QU | Changes the minimum locked QU required for a vault depositor's veto vote to qualify. Options: 50M, 150M (default), 250M, or 350M QU. |
 | 15 | **UPDATE_RELOCK_AMOUNT** | 50M QU | Changes the minimum additional QU a depositor must add when relocking their vault position. Options: 1M, 5M, 10M (default), 20M, 25M, or 50M QU. |
-| 16 | **UPDATE_EXEC_RESERVE_FLOOR** | 50M QU | Sets the execution-fee-reserve safety floor. If the contract's on-chain fee budget drops below it, the contract keeps trading but routes 100% of its profit to the fee reserve (recovery preset) until it refills to 10% above the floor. Options: 0 (off, default), 1B, 5B, 10B, or 20B QU. |
+| 16 | **UPDATE_EXEC_RESERVE_FLOOR** | 50M QU | Sets the execution-fee-reserve safety floor. If the contract's on-chain fee budget drops below it, the contract keeps trading but routes 70% of its profit to the fee reserve (recovery preset; the retained 30% still credits depositors) until it refills to 10% above the floor. Options: 0 (off, default), 1B, 5B, 10B, or 20B QU. |
 | 17 | **SELL_POOL_TOKENS** | 50M QU | Market-sells a chosen percentage (1–100%) of a pool's token holdings on Qswap for QU. The proceeds stay in the contract and are folded into the next profit split — so **both vault depositors and shareholders** benefit (unlike WITHDRAW_ASSET_RESERVE, which sends raw tokens to an outside address). The governance "take profit" / "exit a bag" button. Works on active pools (skim profit while trading continues) or inactive ones (liquidate a paused bag). A 10% slippage floor reverts a catastrophic fill. |
-| 18 | **UPDATE_VIX_FACTOR** | 50M QU | Tunes the Dagger's volatility-breakout sensitivity — how far a token's recent (≈5-day) volatility must rise above its own (≈4-week) baseline before the Dagger starts hunting it. Stored ×100. Options (multiplier of the token's own baseline): 0.09, 0.18, 0.37, 0.75, 1.5, 2 (default), 2.25, 2.75, 3.5, 4.5, 5 — submitted as 9 / 18 / 37 / 75 / 150 / 200 / 225 / 275 / 350 / 450 / 500. Below 1× the Dagger hunts almost always (the floor becomes the gate); higher = more selective. |
+| 18 | **UPDATE_VIX_FACTOR** | 50M QU | Tunes the Dagger's volatility-breakout sensitivity — how far a token's recent fast-horizon (default 2-day, governable via Type 30) volatility must rise above its own slow-horizon (default 1-week, governable via Type 31) baseline before the Dagger starts hunting it. Stored ×100. Options (multiplier of the token's own baseline): 0.09, 0.18, 0.37, 0.75, 1.5, 2 (default), 2.25, 2.75, 3.5, 4.5, 5 — submitted as 9 / 18 / 37 / 75 / 150 / 200 / 225 / 275 / 350 / 450 / 500. Below 1× the Dagger hunts almost always (the floor becomes the gate); higher = more selective. |
 | 19 | **UPDATE_VIX_FLOOR** | 50M QU | Minimum absolute recent volatility (in basis points) for a token to count as "breaking out" — keeps a near-dead token from triggering on a tiny wiggle. Options: 0 (ratio-only), 10, 25 (default), 50, 100, 200 bps. |
-| 20 | **UPDATE_VIX_PULSE_RATE** | 50M QU | How many times a day the Dagger samples each pool's price to update its volatility reading. Options: **1 (default)**, 2, or 3 per day. More = sharper/faster detection but more fee cost; fewer = cheaper but slower to notice a token heating up. The 5-day/4-week volatility horizons stay fixed regardless — only the sampling frequency changes. |
+| 20 | **UPDATE_VIX_PULSE_RATE** | 50M QU | How many times a day the Dagger samples each pool's price to update its volatility reading. Options: **1 (default)**, 2, or 3 per day. More = sharper/faster detection but more fee cost; fewer = cheaper but slower to notice a token heating up. The volatility **horizons** (fast/slow) are separate governable levers (Types 30/31) and are held in *days*, so they stay fixed when the pulse rate changes — only the sampling frequency changes here. |
 | 21 | **UPDATE_SWING_SELL_PCT** | 50M QU | The Cloak's sell chunk — what % of a held bag it sells each time the rally-sell trigger (Type 28) fires. Options: 10, 15, 20, 25, 33, **50 (default)**. Higher = takes profit faster; lower = rides winners longer. |
 | 22 | **UPDATE_BREAKOUT_RESCAN** | 50M QU | How often the Dagger re-checks a hot (breaking-out) pool while it looks for a gap (it still trades every tick once a real gap is found — this only paces the empty looks). Submitted in seconds: 30, 60, 120, 180, 240, **300 (default = 5 min)**. Shorter = catches fast gaps but costs more; longer = cheaper. |
 | 23 | **UPDATE_QX_FEE_MODE** | 50M QU | How the contract sources QX's share-transfer fee for its sell orders. **0 (default)** = per-epoch cached value (cheapest; QX's fee is a fixed 100 QU today). **1** = fetch live from QX before every sell. A forward-looking, **one-way** switch: if QX ever makes its fee tick-variable, shareholders flip this to 1 (no re-deploy). **Permanent once enabled** — it can never be switched back. |
@@ -226,6 +227,11 @@ current NAV — a depositor who has lost significant value no longer qualifies.
 | 26 | **UPDATE_SWING_SIZING** | 50M QU | The Cloak's **position-sizing preset** — bundles the first-buy size, the DCA-in add size, and the per-token cost cap into one setting. Options: **0 (default)** = 1% / 0.25% / 5%; 1 = 1% / 0.25% / 7.5%; 2 = 2% / 0.50% / 10%; 3 = 3% / 0.25% / 15%. Higher = deploys capital faster and allows bigger single-token positions. |
 | 27 | **UPDATE_SWING_DIP** | 50M QU | The Cloak's **buy-dip threshold** — how far the 1-week average must fall below the 3-month average before a pool counts as "in a dip" and the Cloak buys. A 5-point step: 5, 10, 15, 20, 25, **30 (default)** (%). Larger = more patient (only buys deeper dips). |
 | 28 | **UPDATE_SWING_RALLY** | 50M QU | The Cloak's **rally-sell threshold** — how far the price must rise above the position's average cost before the Cloak starts selling (scaling out by the Type 21 sell chunk). A 6-point step: **6 (default)**, 12, 18, 24, 30 (%). Smaller = takes profit sooner. |
+| 29 | **DELETE_POOL** | 50M QU | **Permanently frees a pool's slot** and removes it from the every-tick scan — the final step of a deliberate retirement flow: **deactivate (Type 2) → withdraw/sell everything (Types 11 / 17) → delete**. Guard: the pool must already be deactivated **and** fully empty (no reserve tokens, no open Cloak position, nothing pending in recovery), otherwise it's rejected at submission. At epoch end the last pool swaps into the freed slot and the pool count shrinks. Irreversible and re-indexes pools, but the asset can be **re-added later** via ADD_POOL as a fresh pool. Uses `poolIndex`. |
+| 30 | **UPDATE_VIX_FAST_DAYS** | 50M QU | The Dagger's **fast volatility horizon** in days — the short window compared against the slow baseline (Type 31) to spot a breakout. Smaller = more reactive. Held in days and independent of the pulse rate (Type 20). Options: **2 (default)**, 3, 4, 5. |
+| 31 | **UPDATE_VIX_SLOW_WEEKS** | 50M QU | The Dagger's **slow volatility baseline** in weeks — the long window the fast horizon is measured against. Submitted in weeks, stored ×7 as days. Larger = a calmer, slower baseline. Options: **1 (default = 1 week)**, 2, 3, 4. |
+| 32 | **UPDATE_SWING_CADENCE** | 50M QU | The Cloak's **per-pool check cadence** in days — how often each pool is re-evaluated for a buy/sell (the shared per-pool cooldown). Smaller = more responsive but more fee activity. Options: **30 (default ≈ monthly)**, 20, 10, 5. |
+| 33 | **UPDATE_TICKRATE_PIN** | 50M QU | **Emergency seatbelt** for the self-healing tick rate (see *Self-healing tick rate* below). `newValue` = **0** (auto/self-heal, default) or **1–40** = pin the contract's tick-rate to that many ticks/sec and freeze auto-calibration. Only needed if the auto-tuner ever misbehaves. |
 
 **What happens to the fee:** every proposal fee funds the contract's **execution-fee reserve** — none is burned from supply, and none is kept as trading capital.
 
@@ -235,6 +241,23 @@ current NAV — a depositor who has lost significant value no longer qualifies.
 | **Failed / Vetoed** | **69%** (refunded at epoch end) | 31% |
 
 The non-refundable 31% is routed to the reserve at submission; on a pass the held 69% is sent there too (100% total), and on a failure that 69% is refunded to the proposer.
+
+---
+
+## Self-healing tick rate
+
+The contract's timers — the Cloak's monthly cadence, the Dagger's cooldowns, the VIX sampling interval — are all counted in **ticks**, and the network today runs at about **4 ticks per second**. If Qubic's tick speed ever changed, every one of those timers would silently drift: "monthly" could quietly become every three weeks, or every six.
+
+Rather than hard-code 4/sec and hope it never changes (a change would otherwise require redeploying the whole contract), CLKnDGR **measures the real tick speed itself**. Once per day it reads the network's own consensus clock, works out how many ticks actually elapsed in that real day, and blends the result into a smoothed running estimate (`dayTicks`). Every timer is then expressed as a multiple of that live estimate, so each one keeps its real-world meaning no matter how the tick speed moves — with no redeploy.
+
+Because it drives real money timing, it's wrapped in guardrails:
+
+- **Sane-range clamp** — only measured speeds between **1 and 40 ticks/sec** are accepted; anything outside is treated as a glitch and ignored.
+- **Heavy smoothing** — it adapts over roughly a week, so normal network jitter or stutter can't jerk the timers around; a genuine, sustained change is still tracked.
+- **Cold-start** — until it has a full day's measurement it uses today's 4/sec, so behavior at launch is identical to a fixed-rate contract.
+- **Emergency pin (governance seatbelt)** — if the auto-tuner ever misbehaves, shareholders can freeze the tick-rate to a fixed value via **UPDATE_TICKRATE_PIN (Type 33)**, or set it back to `0` to hand control back to auto.
+
+This is deterministic: the consensus clock reads identically on every computer running the contract, so all of them compute exactly the same `dayTicks`.
 
 ---
 
@@ -279,5 +302,6 @@ community input on:
 - Deployment: up to Computor Governance — reaching the network would require the Computors to approve
   the contract, which hasn't happened and isn't a given.
 - Source code: would be published if the project advances toward deployment.
+- TESTNET UP NEXT :D
 
 *Questions and feedback welcome — this is a proposed protocol and we'd like to get the design right.*
